@@ -107,7 +107,7 @@ def scea(
             ):
                 if verbose:
                     print(
-                        "No clusters found. All points are too close to the mean. Consider lowering detection_limit=%i."
+                        "No clusters found. All points are too close to the mean. Consider lowering detection_limit=%f."
                         % detection_limit
                     )
                 return clusters
@@ -124,7 +124,7 @@ def scea(
             ):
                 if verbose:
                     print(
-                        "No clusters found. All points are too close to the mean. Consider lowering detection_limit=%i."
+                        "No clusters found. All points are too close to the mean. Consider lowering detection_limit=%f."
                         % detection_limit
                     )
                 return clusters
@@ -237,6 +237,186 @@ def find_one_cluster_v31(
             distance_matrix = (
                 haversine_distances(np.radians(points)) * 6371000 / 1000
             )  # multiply by Earth radius to get kilometers
+        else:
+            raise Exception("Unknown distance_matrix option")
+
+    # Initialize cluster
+    cluster = np.zeros(len(points), dtype=bool)
+    radiating_points = np.zeros(len(points), dtype=bool)
+
+    # Find the index with max point_value value. Add it to the cluster
+    argmax = np.argmax(point_value)
+    cluster[argmax] = True
+    radiating_points[argmax] = True
+
+    # Find points around of added_points that are not already in the cluster. These are the new points.
+    while True:
+        not_old_points = np.logical_not(cluster)
+        new_points = np.zeros(len(points), dtype=bool)  # initialize array with Falses
+
+        # If there are no points left to add, break
+        if not_old_points.sum() == 0:
+            break
+
+        # Find points added in this iteration
+        for i in np.nonzero(radiating_points)[0]:
+            # try:
+            #    radius_of_closest_point_not_in_cluster = np.min(
+            #        distance_matrix[i][not_old_points]
+            #    )
+            # except:
+            #    pass
+            radius_of_closest_point_not_in_cluster = np.min(
+                distance_matrix[i][not_old_points]
+            )
+            min_index = np.min(
+                [len(distance_matrix[i]) - 1, max_points_in_start_radius]
+            )
+            radius_of_nth_closest_point = np.partition(distance_matrix[i], min_index)[
+                min_index
+            ]
+
+            points_in_radius = distance_matrix[
+                i
+            ] < radius_of_closest_point_not_in_cluster * radius_func(point_value[i])
+            if (
+                radius_of_closest_point_not_in_cluster < radius_of_nth_closest_point
+            ) and (points_in_radius.sum() != 0):
+                new_points = np.logical_or(
+                    new_points, np.logical_and(points_in_radius, not_old_points)
+                )
+            else:
+                # Stop radiating
+                radiating_points[i] = False
+
+        cluster = np.logical_or(new_points, cluster)  # Add new point to cluster
+        radiating_points = np.logical_or(
+            radiating_points, new_points
+        )  # get index of added points
+
+        # Stop when no new points are added
+        if new_points.sum() == 0:
+            break
+
+    return cluster
+
+
+# ===============================================================================
+
+def half_ellipse(X,Y, x0=0, y0=0, a=2, b=1, rotation=0, rotation_unit='radians'):
+    """
+    Returns the value of the half-ellipse function at points (X, Y).
+    Inside half-ellipse if value <= 1.
+    Parameters:
+    X : np.ndarray
+        X-coordinates of the points.
+    Y : np.ndarray
+        Y-coordinates of the points.
+    a : float
+        Axis length towards the rotation direction.
+    b : float
+        Axis length perpendicular to the rotation direction.
+    rotation : float
+        Rotation angle in unit determined by "rotation_unit".
+    rotation_unit : str
+        'radians' or 'degrees' for the rotation angle.
+    Returns:
+    np.ndarray
+        Values of the half-ellipse function at (X, Y).
+    """
+    if rotation_unit == 'degrees':
+        rotation = np.deg2rad(rotation)
+    X_rot = np.cos(rotation) * (X - x0) + np.sin(rotation) * (Y - y0)
+    Y_rot = -np.sin(rotation) * (X - x0) + np.cos(rotation) * (Y - y0)
+    return np.sqrt(((X_rot)**2) / ((X_rot>=0)*(a**2)+(X_rot<0)*b**2)  +  ((Y_rot)**2) / (b**2))
+
+
+
+def calc_half_ellipse_distance_matrix(X, Y, a, b, rotation, rotation_unit='radians'):
+    """
+    Computes the pairwise half-ellipse distance matrix for the given points,
+    considering wind direction and magnitude.
+    Returns:
+    np.ndarray
+        Pairwise half-ellipse distance matrix.
+    """
+    X = X.flatten()
+    Y = Y.flatten()
+    half_ellipse_distance_matrix = np.zeros((X.shape[0], X.shape[0]))
+
+    for i in range(X.shape[0]):
+        half_ellipse_distance_matrix[i] = half_ellipse(X, Y, x0=X[i], y0=Y[i], a=a, b=b, rotation=rotation, rotation_unit=rotation_unit)
+
+    return half_ellipse_distance_matrix
+
+
+
+def wind_to_angle_and_magnitude(wind_vector):
+    """
+    Converts a wind vector to its angle and magnitude.
+    """
+    wind_magnitude = np.sqrt(wind_vector[0]**2 + wind_vector[1]**2)
+    wind_angle = np.arctan2(wind_vector[1], wind_vector[0])
+    return wind_angle, wind_magnitude
+
+
+
+# =================================================================================
+
+
+
+def find_one_cluster_with_wind(
+    points,
+    point_value,
+    radius_func="default",
+    growth_limit=2,
+    distance_matrix="euclidean",
+    max_points_in_start_radius=7,
+    preprocessor="Standard",
+    a=2,
+    wind=None,
+):
+    """
+    Stars with radius thats equal to distance to closest point, and then applies the radius function.
+
+    """
+
+    if radius_func == "default":
+        radius_func = lambda x: np.min([1 + x - growth_limit, 2])
+
+    # Preprocessing
+    if preprocessor == "Standard":
+        point_value = (
+            preprocessing.StandardScaler()
+            .fit_transform(point_value.reshape(-1, 1))
+            .flatten()
+        )
+    elif preprocessor == "Quantile":
+        point_value = (
+            preprocessing.QuantileTransformer(
+                output_distribution="uniform", n_quantiles=3
+            )
+            .fit_transform(point_value.reshape(-1, 1))
+            .flatten()
+        )
+    elif preprocessor == "None":
+        pass
+    else:
+        point_value = preprocessor.fit_transform(point_value.reshape(-1, 1)).flatten()
+
+    # Distance matrix for points
+    if isinstance(distance_matrix, str):
+        if distance_matrix == "euclidean":
+            distance_matrix = squareform(pdist(points))
+        elif distance_matrix == "haversine":
+            distance_matrix = (
+                haversine_distances(np.radians(points)) * 6371000 / 1000
+            )  # multiply by Earth radius to get kilometers
+        elif distance_matrix == "half_ellipse":
+            if wind is None:
+                raise Exception("Wind parameter must be provided for half_ellipse distance matrix")
+            wind_angle, wind_magnitude = wind_to_angle_and_magnitude(wind)
+            distance_matrix = calc_half_ellipse_distance_matrix(points[:,0], points[:,1], a=1+wind_magnitude, b=1, rotation=wind_angle, rotation_unit='radians')
         else:
             raise Exception("Unknown distance_matrix option")
 
