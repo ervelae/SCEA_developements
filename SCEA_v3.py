@@ -6,6 +6,8 @@ from sklearn.metrics.pairwise import haversine_distances
 from sklearn import preprocessing
 from geopy.distance import geodesic
 from pyproj import Geod
+import warnings
+import colorcet as cc
 
 
 # --- Custom distance metric: directed half-ellipse ---
@@ -477,7 +479,24 @@ def print_cluster_stats(clusters, values):
     pass
 
 
-# ----------------------------- SCEA main implementation ----------------------------- #
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ======================= SCEA main implementation ======================== #
 def scea(
     coords,
     values,
@@ -673,3 +692,623 @@ def scea(
         clusters = clusters.reshape(shape)
 
     return clusters
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================== SCEA helper functions and utils (preprocessing, etc.) ============================ #
+
+
+from scipy.ndimage import gaussian_filter, uniform_filter
+import xarray as xr
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+
+def nan_gaussian_filter(data, sigma=1.5):
+    mask = np.isfinite(data).astype(float)
+    data_filled = np.where(np.isfinite(data), data, 0.0)
+    smooth = gaussian_filter(data_filled, sigma=sigma, mode="nearest")
+    weight = gaussian_filter(mask, sigma=sigma, mode="nearest")
+    result = np.where(weight > 0, smooth / weight, np.nan)
+    return np.where(mask > 0, result, np.nan)
+
+
+def wind_to_angle_and_magnitude(wind_vector):
+    """
+    Converts a wind vector or array of wind vectors to angle(s) and magnitude(ies).
+    
+    Parameters:
+    wind_vector : np.ndarray
+        Wind vector(s) with the last dimension being 2 (for [wx, wy]).
+        Can be 1D [wx, wy], 2D (n, 2), 3D (n, m, 2), or higher dimensions.
+    
+    Returns:
+    tuple
+        (wind_angles, wind_magnitudes) with the same shape as the input,
+        except the last dimension is removed (since it contained [wx, wy]).
+        wind_angle(s) are in radians.
+    
+    Example:
+        Single vector [1, 1] -> scalar, scalar
+        Multiple vectors (3, 2) -> (3,), (3,)
+        Grid of vectors (n, m, 2) -> (n, m), (n, m)
+    """
+    wind_vector = np.asarray(wind_vector)
+    
+    if wind_vector.shape[-1] != 2:
+        raise ValueError(f"Last dimension must be 2 (for [wx, wy]), got shape {wind_vector.shape}")
+    
+    # Avoid -0.0 issues
+    wind_vector = wind_vector.copy()
+    wind_vector[wind_vector == 0] = 0
+    
+    # Extract wx and wy using the last dimension
+    wx = wind_vector[..., 0]
+    wy = wind_vector[..., 1]
+    
+    wind_magnitude = np.sqrt(wx ** 2 + wy ** 2)
+    wind_angle = np.arctan2(wy, wx)
+    
+    return wind_angle, wind_magnitude
+
+
+
+def match_era5_wind_to_tropomi(tropomi_data, era5_data, era5_variables=['wind_magnitude_100m', 'wind_angle_100m', 'wind_magnitude_10m', 'wind_angle_10m']):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="no explicit representation of timezones available for np.datetime64",
+            category=UserWarning,
+        )
+        tropomi_data["time_utc"] = xr.apply_ufunc(
+            lambda x: np.datetime64(x, "ns"),
+            tropomi_data["time_utc"],
+            vectorize=True,
+            dask="allowed",
+            output_dtypes=[np.dtype("datetime64[ns]")],
+        )
+
+    wind_data = {}
+
+    for var in era5_variables:
+        wind_data[var] = era5_data[var].sel(
+            latitude=tropomi_data.latitude[0],
+            longitude=tropomi_data.longitude[0],
+            time=tropomi_data.time_utc[0].broadcast_like(tropomi_data["longitude"][0]),
+            method="nearest",
+        )
+    
+    return wind_data
+
+
+
+def scale_wind_magnitude_for_distance_matrix(wind_magnitudes, method="linear", parameter=None):
+    if method == "linear":
+        if parameter is None:
+            parameter = 0.03  # default linear scaling factor
+        return parameter * wind_magnitudes
+    elif method == "sqrt":
+        if parameter is None:
+            parameter = 0.2  # default sqrt scaling factor
+        return parameter * np.sqrt(wind_magnitudes)
+    elif method == "log":
+        if parameter is None:
+            parameter = 0.3  # default log scaling factor
+        return parameter * np.log(1 + wind_magnitudes)
+    else:
+        raise ValueError("Unknown scaling method")
+    
+
+
+def xr_local_standardization(da, window=11):
+    # accept either DataArray or ndarray
+    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    mask = np.isfinite(data).astype(float)
+    data_filled = np.where(np.isfinite(data), data, 0.0)
+
+    sum_ = uniform_filter(data_filled, window) * (window ** 2)
+    sumsq = uniform_filter(data_filled**2, window) * (window ** 2)
+    w = uniform_filter(mask, window) * (window ** 2)
+
+    mean = np.where(w > 0, sum_ / (w+1e-12), np.nan)
+    var = np.where(w > 0, sumsq / (w+1e-12) - mean**2, np.nan)
+    std = np.sqrt(np.maximum(var, 0.0))
+
+    standardized = (data - mean) / (std + 1e-12)
+
+    # zero values back to NaN
+    standardized = np.where(mask > 0, standardized, np.nan)
+    
+    return xr.DataArray(standardized)
+
+
+
+
+
+
+# ==================================================================================================================================================================================================================================================
+
+
+def scea_interactive(
+        lon, lat, value,  
+        windows_list = [9, 11, 13, 15, 21, 31, 51, 101, 151, 201, 301, 501],
+        wind_data=None,
+):
+
+    # Interactive multi-scale sliders + optional SCEA run (extended with per-scale denoise)
+    from ipywidgets import IntSlider, FloatSlider, Button, HBox, Layout, VBox, Output, Dropdown, Checkbox, FloatText, IntText, Label, AppLayout
+    import ipywidgets as widgets
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+
+    compact_layout = Layout(width='130px')
+    less_compact_layout = Layout(width='140px')
+    full_desc = {"description_width": "initial"}
+    scea_parameters_layout_float = Layout(width='160px')  # top and bottom margin for spacing
+    scea_parameters_layout_int = Layout(width='180px')  # top and bottom margin for spacing
+
+
+    out = Output()
+    #last = {"combined": None, "clusters": None}
+    standardized_cache = {}
+
+    last = {"combined": None}
+    cluster_store = {}                  # {"clusters_1": array, "clusters_2": array, ...}
+    cluster_counter = {"n": 0}          # mutable counter for closures
+
+    cluster_select = Dropdown(
+        options=[("None", "none")],
+        value="none",
+        description="Clusters:",
+        layout=Layout(width='240px')
+    )
+
+
+    # --- scale/window controls ---
+    w_small = Dropdown(options=windows_list, value=9, description="window_s", layout=less_compact_layout)
+    w_med   = Dropdown(options=windows_list, value=13, description="window_s", layout=less_compact_layout)
+    w_large = Dropdown(options=windows_list, value=501, description="window_s", layout=less_compact_layout)
+
+    c_small = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
+    c_med   = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
+    c_large = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
+
+
+    use_small = Checkbox(value=True, description="SMALL WINDOW")
+    use_medium = Checkbox(value=True, description="MEDIUM WINDOW")
+    use_large = Checkbox(value=True, description="LARGE WINDOW")
+    use_raw = Checkbox(value=False, description="RAW DATA")
+
+    # --- per-scale pre-denoise controls ---
+    denoise_pre_small = Checkbox(value=False, description="denoise_pre", layout=Layout(width='210px'))
+    denoise_pre_medium = Checkbox(value=False, description="denoise_pre", layout=Layout(width='210px'))
+    denoise_pre_large = Checkbox(value=True, description="denoise_pre", layout=Layout(width='210px'))
+
+    sigma_pre_small = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    sigma_pre_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    sigma_pre_large = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+
+    # --- per-scale post-denoise controls ---
+    denoise_post_small = Checkbox(value=False, description="denoise_post", layout=Layout(width='210px'))
+    denoise_post_medium = Checkbox(value=True, description="denoise_post", layout=Layout(width='210px'))
+    denoise_post_large = Checkbox(value=False, description="denoise_post", layout=Layout(width='210px'))
+
+    sigma_post_small = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    sigma_post_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    sigma_post_large = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+
+    # --- overlay controls ---
+    show_clusters = Checkbox(value=False, description="overlay clusters", layout=Layout(width='210px'))
+    overlay_option = Dropdown(
+        options=[
+            ('None', 'none'),
+            ('Raw', 'raw'),
+            ('Combined Standardized', 'combined'),
+            ('Small Only', 'small'),
+            ('Medium Only', 'medium'),
+            ('Large Only', 'large'),
+        ],
+        value='combined',
+        description='OVERLAY: ',
+        layout=Layout(width='240px')
+    )
+
+
+    # --- raw data controls ---
+    denoise_raw = Checkbox(value=False, description="denoise_raw", layout=Layout(width='210px'))
+    sigma_raw = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    c_raw = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
+
+    # --- SCEA controls (text boxes) ---
+    scea_label = Label(
+        "SCEA PARAMETERS:",
+        layout=Layout(margin="0 10px 0 0", width="150px")  # right margin adds space after text
+    )
+    growth_limit_w = FloatText(value=2.1, step=0.2, description="growth_limit", tooltip="asdf asdf asdf", layout=scea_parameters_layout_float, style=full_desc)
+    detection_limit_w = FloatText(value=2.5, step=0.2, description="detection_limit", layout=scea_parameters_layout_float, style=full_desc)
+    local_box_size_w = IntText(value=4, description="local_box_radius", layout=scea_parameters_layout_int, style=full_desc)
+    max_pts_start_radius_w = IntText(value=5, description="max_pts_start_radius", layout=scea_parameters_layout_int, style=full_desc)
+    run_btn = Button(description="Run SCEA", button_style="warning", style=full_desc, tooltip=" asdf asdf asdf s")
+
+    # --- wind controls ---
+    use_wind = Checkbox(value=True, description="Use wind in SCEA")
+    wind_level = Dropdown(
+        options=[("100m", "100m"), ("10m", "10m")],
+        value="100m",
+        description="wind level",
+        layout=scea_parameters_layout_float,
+    )
+    wind_scale_method = Dropdown(
+        options=[("linear", "linear"), ("sqrt", "sqrt"), ("log", "log")],
+        value="linear",
+        description="wind scale",
+        layout=scea_parameters_layout_float,
+    )
+    wind_scale_param = FloatText(value=0.05, step=0.01, description="wind param", layout=scea_parameters_layout_float)
+
+    overlay_wind_arrows = Checkbox(value=False, description="overlay wind arrows", layout=Layout(width='230px'))
+
+
+
+
+    def apply_denoise(arr, sigma=1.5):
+        return nan_gaussian_filter(arr, sigma=float(sigma))
+
+    def get_local_standardization(window, denoise_pre_flag, sigma_pre_val, denoise_post_flag, sigma_post_val):
+        key = (
+            int(window),
+            bool(denoise_pre_flag),
+            round(float(sigma_pre_val), 3),
+            bool(denoise_post_flag),
+            round(float(sigma_post_val), 3),
+        )
+        if key in standardized_cache:
+            return standardized_cache[key]
+
+        base = value
+        
+        # Pre-denoise
+        if denoise_pre_flag:
+            base = apply_denoise(base, sigma=sigma_pre_val)
+        
+        # Standardize
+        arr = np.asarray(xr_local_standardization(base, window=int(window)))
+        
+        # Post-denoise
+        if denoise_post_flag:
+            arr = apply_denoise(arr, sigma=sigma_post_val)
+        
+        standardized_cache[key] = arr
+        return arr
+
+
+    def render_combined():
+        s = get_local_standardization(
+            w_small.value, 
+            denoise_pre_small.value, sigma_pre_small.value,
+            denoise_post_small.value, sigma_post_small.value
+        )
+        m = get_local_standardization(
+            w_med.value,
+            denoise_pre_medium.value, sigma_pre_medium.value,
+            denoise_post_medium.value, sigma_post_medium.value
+        )
+        l = get_local_standardization(
+            w_large.value,
+            denoise_pre_large.value, sigma_pre_large.value,
+            denoise_post_large.value, sigma_post_large.value
+        )
+        
+        # Raw data (optionally denoised)
+        raw = value
+        if denoise_raw.value:
+            raw = apply_denoise(raw, sigma=sigma_raw.value)
+        # Standardize raw to match the scale of s/m/l
+        raw = (raw - np.nanmean(raw)) / (np.nanstd(raw) + 1e-12)
+
+        combined = (
+            (float(c_small.value) if use_small.value else 0.0) * s
+            + (float(c_med.value) if use_medium.value else 0.0) * m
+            + (float(c_large.value) if use_large.value else 0.0) * l
+            + (float(c_raw.value) if use_raw.value else 0.0) * raw
+        )
+
+        last["combined"] = combined
+        return combined
+
+    def update_plot(*_):
+        
+        combined = render_combined()
+
+        # Get standardized data for each scale
+        s = get_local_standardization(
+            w_small.value,
+            denoise_pre_small.value, sigma_pre_small.value,
+            denoise_post_small.value, sigma_post_small.value
+        )
+        m = get_local_standardization(
+            w_med.value,
+            denoise_pre_medium.value, sigma_pre_medium.value,
+            denoise_post_medium.value, sigma_post_medium.value
+        )
+        l = get_local_standardization(
+            w_large.value,
+            denoise_pre_large.value, sigma_pre_large.value,
+            denoise_post_large.value, sigma_post_large.value
+        )
+        
+        with out:
+            out.clear_output(wait=True)
+            fig, ax = plt.subplots(1, 1, figsize=(14, 8), subplot_kw={"projection": ccrs.PlateCarree()}, dpi=150)
+            
+            # Determine what to display based on overlay_option
+            if overlay_option.value == 'raw':
+                display_data = value
+                title_suffix = "Raw Data"
+            elif overlay_option.value == 'small':
+                display_data = s
+                title_suffix = f"Small (w={w_small.value})"
+            elif overlay_option.value == 'medium':
+                display_data = m
+                title_suffix = f"Medium (w={w_med.value})"
+            elif overlay_option.value == 'large':
+                display_data = l
+                title_suffix = f"Large (w={w_large.value})"
+            else:  # 'combined' or 'none'
+                display_data = combined
+                title_suffix = "Standardization windows combined"
+            
+            # Only plot if not 'none'
+            if overlay_option.value != 'none':
+                pcm = ax.pcolormesh(
+                    lon, lat, display_data,
+                    shading="auto",
+                    vmax=np.nanquantile(display_data[~np.isnan(display_data)], 0.999),
+                    transform=ccrs.PlateCarree(),
+                    cmap="cmc.batlow"
+                )
+                plt.colorbar(pcm, ax=ax)
+            
+            ax.coastlines()
+            ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+            ax.add_feature(cfeature.LAND, alpha=0.5)
+            ax.add_feature(cfeature.OCEAN, facecolor="lightblue", alpha=0.5)
+            
+            # Overlay clusters if enabled and available
+            selected_key = cluster_select.value
+            selected_clusters = cluster_store.get(selected_key) if selected_key != "none" else None
+
+            if show_clusters.value and selected_clusters is not None:
+                ax.pcolormesh(
+                    lon, lat,
+                    np.where(selected_clusters > 0, selected_clusters, np.nan),
+                    shading="auto",
+                    transform=ccrs.PlateCarree(),
+                    cmap=cc.cm.glasbey_light,
+                    alpha=1,
+                )
+                ax.set_title(f"{title_suffix} + {selected_key}")
+            else:
+                ax.set_title(f"{title_suffix}")
+                    
+            if overlay_wind_arrows.value:
+                angle_key = f"wind_angle_{wind_level.value}"
+                mag_key = f"wind_magnitude_{wind_level.value}"
+
+                #wind_data_tropomi = match_era5_wind_to_tropomi(tropomi_data_cropped, era5_data)
+
+                angle = wind_data[angle_key].data
+                mag = wind_data[mag_key].data
+
+                # Apply same preprocessing used for SCEA
+                mag_scaled = scale_wind_magnitude_for_distance_matrix(
+                    mag.flatten(),
+                    method=wind_scale_method.value,
+                    parameter=float(wind_scale_param.value),
+                ).reshape(mag.shape)
+
+                skip = (slice(None, None, 3), slice(None, None, 3))
+                u = mag_scaled * np.cos(angle)
+                v = mag_scaled * np.sin(angle)
+
+                ax.quiver(
+                    lon[skip], lat[skip],
+                    u[skip], v[skip],
+                    transform=ccrs.PlateCarree(),
+                    color="black",
+                    alpha=0.45,
+                    scale=10,
+                    width=0.001,
+                    headaxislength=3,
+                )
+
+            plt.show()
+
+    def mark_clusters_stale(*_):
+        run_btn.button_style = "warning"
+        run_btn.description = "Run SCEA (stale)"
+        update_plot()
+
+    def run_scea_clicked(b):
+        show_clusters.value = False
+        b.description = "Running..."
+        b.disabled = True
+        b.button_style = "info"
+
+        combined = last.get("combined") if last.get("combined") is not None else render_combined()
+
+        point_coordinates = [lon, lat]
+
+        # default SCEA args (no wind)
+        scea_kwargs = dict(
+            coords=point_coordinates,
+            values=combined,
+            growth_limit=float(growth_limit_w.value),
+            detection_limit=float(detection_limit_w.value),
+            local_box_size=int(local_box_size_w.value),
+            max_pts_start_radius=int(max_pts_start_radius_w.value),
+            metric="geodesic",
+        )
+
+        if use_wind.value:
+            # expects 'era5_data' and match_era5_wind_to_tropomi(...) available from earlier cells
+
+            angle_key = f"wind_angle_{wind_level.value}"
+            mag_key = f"wind_magnitude_{wind_level.value}"
+
+            scaled_mag = scale_wind_magnitude_for_distance_matrix(
+                wind_data[mag_key].data.flatten(),
+                method=wind_scale_method.value,
+                parameter=float(wind_scale_param.value),
+            )
+
+            scea_kwargs["metric"] = "geodesic_half_ellipse"
+            scea_kwargs["distance_matrix_kwargs"] = {
+                "rotation": wind_data[angle_key].data.flatten(),
+                "magnitude": scaled_mag,
+            }
+
+        clusters = scea(**scea_kwargs)
+
+        cluster_counter["n"] += 1
+        cluster_name = f"clusters_{cluster_counter['n']}"
+        cluster_store[cluster_name] = np.array(clusters, copy=True)
+
+        # Refresh dropdown options and select newest result
+        cluster_select.options = [("None", "none")] + [(k, k) for k in cluster_store.keys()]
+        cluster_select.value = cluster_name
+
+        #show_clusters.value = True
+
+        b.description = "Run SCEA"
+        b.button_style = "success"
+        b.disabled = False
+        show_clusters.value = True
+
+    # Register all widget observers BEFORE initial display
+    for widget in (
+        w_small, w_med, w_large, c_small, c_med, c_large,
+        use_small, use_medium, use_large, use_raw,
+        denoise_pre_small, denoise_pre_medium, denoise_pre_large,
+        sigma_pre_small, sigma_pre_medium, sigma_pre_large,
+        denoise_post_small, denoise_post_medium, denoise_post_large,
+        sigma_post_small, sigma_post_medium, sigma_post_large,
+        denoise_raw, sigma_raw, c_raw,
+        use_wind, wind_level, wind_scale_method, wind_scale_param
+    ):
+        widget.observe(mark_clusters_stale, names="value")
+
+    # Overlay and cluster visibility changes
+    overlay_option.observe(update_plot, names="value")
+    show_clusters.observe(update_plot, names="value")
+    overlay_wind_arrows.observe(update_plot, names="value")
+    cluster_select.observe(update_plot, names="value")
+
+    # SCEA params invalidate clusters
+    for widget in (growth_limit_w, detection_limit_w, local_box_size_w, max_pts_start_radius_w):
+        widget.observe(mark_clusters_stale, names="value")
+
+    # Register button click
+    run_btn.on_click(run_scea_clicked)
+
+    center_layout = Layout(align_items='center', justify_content='center', background_color='lightblue')
+    parameters_layout = Layout(display='flex', flex_flow='', align_items='flex-start', justify_content='flex-start',  padding='5px')
+    parameters_layout = Layout(
+        display="flex",
+        flex_flow="row wrap",
+        align_items="center",
+        justify_content="flex-start",
+        gap="8px",
+        padding="0px",
+    )
+    row_layout = Layout(
+        justify_content="flex-end",
+        align_items="center",
+        gap="0px",                     # small explicit gap
+        margin="0",
+        padding="0",
+        width="fit-content",
+    )
+    section_layout = Layout(
+        border="1px solid gray",
+        padding="0px 0px",
+        margin="0",
+        width="265px",      # shrink section to children
+        align_items="flex-end",
+    )
+    scales_row_layout = Layout(
+        justify_content="flex-start",
+        align_items="flex-start",
+        gap="8px",
+        width="fit-content",
+    )
+    controls_layout = Layout(
+        align_items="flex-start",
+        gap="6px",
+    )
+
+    # Controls layout
+    controls = VBox([
+        Label("DATA PRE-PROCESSING: Adaptive standardization with multiple scales and optional denoising", layout=Layout(padding="0px 0px 0px 5px")),
+        HBox([
+            VBox([
+                HBox([use_small], layout=row_layout),
+                HBox([denoise_pre_small, sigma_pre_small], layout=row_layout),
+                HBox([w_small, c_small], layout=row_layout),
+                HBox([denoise_post_small, sigma_post_small], layout=row_layout),
+            ], layout=section_layout),
+            VBox([
+                HBox([use_medium], layout=row_layout),
+                HBox([denoise_pre_medium, sigma_pre_medium], layout=row_layout),
+                HBox([w_med, c_med], layout=row_layout),
+                HBox([denoise_post_medium, sigma_post_medium], layout=row_layout),
+            ], layout=section_layout),
+            VBox([
+                HBox([use_large], layout=row_layout),
+                HBox([denoise_pre_large, sigma_pre_large], layout=row_layout),
+                HBox([w_large, c_large], layout=row_layout),
+                HBox([denoise_post_large, sigma_post_large], layout=row_layout),
+            ], layout=section_layout),
+            VBox([
+                HBox([use_raw], layout=row_layout),
+                HBox([denoise_raw, sigma_raw], layout=row_layout),
+                HBox([Label("")], layout=row_layout),  # spacer to align with window rows
+                HBox([c_raw], layout=row_layout),
+            ], layout=section_layout),
+        ], layout=scales_row_layout),
+
+        HBox([scea_label, growth_limit_w, detection_limit_w, local_box_size_w, max_pts_start_radius_w, run_btn], layout=parameters_layout),
+        HBox([use_wind, wind_level, wind_scale_method, wind_scale_param], layout=parameters_layout),
+        HBox([overlay_option, show_clusters, cluster_select, overlay_wind_arrows ], layout=Layout(padding="15px")),
+    ], layout=controls_layout)
+
+    # Display UI and initial plot
+    display(controls, out)
+    update_plot()
