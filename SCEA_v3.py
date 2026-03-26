@@ -8,6 +8,9 @@ from geopy.distance import geodesic
 from pyproj import Geod
 import warnings
 import colorcet as cc
+import xarray as xr
+from numba import njit, prange
+import bisect
 
 
 # --- Custom distance metric: directed half-ellipse ---
@@ -723,19 +726,37 @@ def scea(
 # =========================== SCEA helper functions and utils (preprocessing, etc.) ============================ #
 
 
-from scipy.ndimage import gaussian_filter, uniform_filter
+from scipy.ndimage import gaussian_filter, generic_filter, uniform_filter
 import xarray as xr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
 
-def nan_gaussian_filter(data, sigma=1.5):
+def nan_gaussian_filter(data, sigma=1.0, mode="nearest"):
+    """
+    Applies a Gaussian filter to data that may contain NaNs, treating NaNs as missing values and not letting them contribute to the smoothing of valid data. 
+    The output will have NaN in any position where the original data had NaN, and valid smoothed values elsewhere.
+
+    """
     mask = np.isfinite(data).astype(float)
+    
+    # Fill NaNs with zeros for convolution; the mask will correct for this later.
     data_filled = np.where(np.isfinite(data), data, 0.0)
-    smooth = gaussian_filter(data_filled, sigma=sigma, mode="nearest")
-    weight = gaussian_filter(mask, sigma=sigma, mode="nearest")
+
+    # Apply Gaussian filter to both the filled data
+    ## The result will be biased low near NaNs(=0.0), but we will correct for that using the weights from the mask.
+    smooth = gaussian_filter(data_filled, sigma=sigma, mode=mode)
+
+    # Apply Gaussian filter to the mask to get the effective weights (sum of kernel over valid points)
+    ## If a point has NaN neighbors, the weight will be less than 1, and we can use this to correct the smoothed value.
+    weight = gaussian_filter(mask, sigma=sigma, mode=mode) 
+
+    # Avoid division by zero: where weight is zero, we set the result to NaN (since it means there were no valid points contributing to the smooth value).
     result = np.where(weight > 0, smooth / weight, np.nan)
+
+    # Finally, we also want to ensure that any point that was originally NaN remains NaN in the output, even if the smoothed value is non-NaN due to neighboring values.
     return np.where(mask > 0, result, np.nan)
+
 
 
 def wind_to_angle_and_magnitude(wind_vector):
@@ -779,6 +800,11 @@ def wind_to_angle_and_magnitude(wind_vector):
 
 
 def match_era5_wind_to_tropomi(tropomi_data, era5_data, era5_variables=['wind_magnitude_100m', 'wind_angle_100m', 'wind_magnitude_10m', 'wind_angle_10m']):
+    """
+    Matches ERA5 wind data to TROPOMI data based on spatial and temporal coordinates.
+    """
+
+    # Convert TROPOMI time to np.datetime64 if it's not already, suppressing timezone warnings
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -795,6 +821,7 @@ def match_era5_wind_to_tropomi(tropomi_data, era5_data, era5_variables=['wind_ma
 
     wind_data = {}
 
+    # Select the nearest ERA5 grid point for each TROPOMI point in space and time, and extract the specified wind variables.
     for var in era5_variables:
         wind_data[var] = era5_data[var].sel(
             latitude=tropomi_data.latitude[0],
@@ -825,27 +852,317 @@ def scale_wind_magnitude_for_distance_matrix(wind_magnitudes, method="linear", p
     
 
 
-def xr_local_standardization(da, window=11):
+def local_standardization(da, window=11, eps=1e-12):
+    """
+    Local standardization using a sliding window.
+    """
+
+    # Windows must be odd to have a center pixel
+    if isinstance(window, int):
+        if window % 2 == 0:
+            raise ValueError("Window size must be odd.")
+    else:
+        if window[0] % 2 == 0 or window[1] % 2 == 0:
+            raise ValueError("Window sizes must be odd.")
+
     # accept either DataArray or ndarray
     data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
 
+    # Create a mask for finite values and fill NaNs with zeros for convolution
+    ## The mask will be used to correct the sums and counts to get the true local mean and std, while the filled data allows us to use uniform_filter without NaN issues.
     mask = np.isfinite(data).astype(float)
     data_filled = np.where(np.isfinite(data), data, 0.0)
 
+    # Compute local sums and sums of squares using uniform_filter, which gives us the total sum in each window. We will divide by the effective count of valid points (from the mask) to get the mean and variance.
     sum_ = uniform_filter(data_filled, window) * (window ** 2)
     sumsq = uniform_filter(data_filled**2, window) * (window ** 2)
+
+    # The effective number of valid points in each window (the sum of the mask) is needed to compute the mean and variance correctly, since uniform_filter will treat NaNs as zeros.
     w = uniform_filter(mask, window) * (window ** 2)
 
-    mean = np.where(w > 0, sum_ / (w+1e-12), np.nan)
-    var = np.where(w > 0, sumsq / (w+1e-12) - mean**2, np.nan)
+    # Compute local mean and variance, correcting for the number of valid points. Where w is zero (no valid points), we set mean and std to NaN.
+    mean = np.where(w > 0, sum_ / (w+eps), np.nan)
+
+    # Variance is E[X^2] - (E[X])^2, where E[X^2] is sumsq / w and E[X] is mean. We also need to ensure that we don't get negative variance due to numerical issues, hence the np.maximum with 0.
+    var = np.where(w > 0, sumsq / (w+eps) - mean**2, np.nan)
     std = np.sqrt(np.maximum(var, 0.0))
 
-    standardized = (data - mean) / (std + 1e-12)
+    standardized = (data - mean) / (std + eps)
 
     # zero values back to NaN
     standardized = np.where(mask > 0, standardized, np.nan)
     
-    return xr.DataArray(standardized)
+    return standardized
+
+
+
+def nanmedian_filter_exact(data, window):
+    """
+    NaN-aware median filter matching:
+        scipy.ndimage.generic_filter(..., np.nanmedian, mode="constant", cval=np.nan)
+
+    Supports:
+        - numpy.ndarray
+        - xarray.DataArray (uses data.values[0])
+    """
+
+    # Handle xarray input
+    if isinstance(data, xr.DataArray):
+        arr = data.values[0]
+    else:
+        arr = np.asarray(data)
+
+    H, W = arr.shape
+
+    # Window size handling
+    if isinstance(window, int):
+        wy = wx = window
+    else:
+        wy, wx = window
+
+    pad_y = wy // 2
+    pad_x = wx // 2
+
+    # Pad with NaNs
+    padded = np.pad(
+        arr,
+        ((pad_y, pad_y), (pad_x, pad_x)),
+        mode="constant",
+        constant_values=np.nan,
+    )
+
+    # Initialize output with NaNs
+    out = np.full((H, W), np.nan, dtype=float)
+
+    # Median from sorted list
+    def median_of_sorted(lst):
+        n = len(lst)
+        if n == 0:
+            return np.nan
+        m = n // 2
+        if n % 2:
+            return lst[m]
+        return 0.5 * (lst[m - 1] + lst[m])
+
+    # ==== MAIN LOOP ====
+
+    for y in range(H):
+
+        # === INITIAL WINDOW (x = 0) ===
+        block = padded[y:y+wy, 0:wx]
+        finite = block[np.isfinite(block)]
+        values = list(finite)
+        values.sort()
+
+        out[y, 0] = median_of_sorted(values)
+
+        # === SLIDE HORIZONTALLY ===
+        for x in range(1, W):
+
+            # --- Remove outgoing column ---
+            col_out = padded[y:y+wy, x-1]
+            finite_out = col_out[np.isfinite(col_out)]
+            for v in finite_out:
+                idx = bisect.bisect_left(values, v)
+                values.pop(idx)
+
+            # --- Add incoming column ---
+            col_in = padded[y:y+wy, x-1+wx]
+            finite_in = col_in[np.isfinite(col_in)]
+            for v in finite_in:
+                bisect.insort(values, v)
+
+            out[y, x] = median_of_sorted(values)
+
+    # Preserve original NaNs
+    mask = np.isfinite(arr)
+    return np.where(mask, out, np.nan)
+
+
+
+def local_standardization_m_mad(da, window=11, eps=0, scaling_factor=1.4826):
+    """
+    Modified MAD standardization
+    Local standardization using local median and local modified MAD (median of absolute deviations from local median).
+    """
+    # accept either DataArray or ndarray
+    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    # keep NaNs as NaNs for median/MAD
+    mask = np.isfinite(data)
+    data_nan = np.where(mask, data, np.nan)
+
+    # local median
+    local_median = nanmedian_filter_exact(data_nan, window=window)
+
+    # deviations from local medians
+    abs_dev = np.abs(data_nan - local_median)
+
+    # Local modified MAD: median of absolute deviations from local median
+    local_m_mad = nanmedian_filter_exact(abs_dev, window=window)
+
+    # convert MAD to sigma-equivalent for normal data 
+    # TODO check if this is the right scaling factor for modified MAD
+    robust_std = scaling_factor * local_m_mad
+
+    standardized = (data - local_median) / (robust_std + eps)
+    standardized = np.where(mask, standardized, np.nan)
+
+    return standardized
+
+
+@njit
+def _binary_search_numba(arr, size, val):
+    """Return insertion index for val in sorted arr[:size]."""
+    lo = 0
+    hi = size
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] < val:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@njit
+def _compute_median_numba(buf, size):
+    if size == 0:
+        return np.nan
+    mid = size // 2
+    if size % 2 == 1:
+        return buf[mid]
+    else:
+        return 0.5 * (buf[mid - 1] + buf[mid])
+
+
+@njit(parallel=True)
+def _nanmedian_filter_kernel_numba(padded, H, W, wy, wx):
+    out = np.empty((H, W), dtype=np.float64)
+    maxk = wy * wx
+
+    # ---------- PARALLEL ROW PROCESSING ----------
+    for y in prange(H):
+
+        # Thread-private working buffer
+        buf = np.empty(maxk, dtype=np.float64)
+        size = 0
+
+        # ---- INITIAL WINDOW (x=0) ----
+        size = 0
+        for yy in range(y, y + wy):
+            row = padded[yy, 0:wx]
+            for v in row:
+                if not np.isnan(v):
+                    idx = _binary_search_numba(buf, size, v)
+                    # shift right
+                    for k in range(size, idx, -1):
+                        buf[k] = buf[k - 1]
+                    buf[idx] = v
+                    size += 1
+
+        out[y, 0] = _compute_median_numba(buf, size)
+
+        # ---- SLIDE HORIZONTALLY ----
+        for x in range(1, W):
+
+            # --- remove outgoing column ---
+            for yy in range(y, y + wy):
+                v = padded[yy, x - 1]
+                if not np.isnan(v):
+                    idx = _binary_search_numba(buf, size, v)
+                    # remove at idx
+                    for k in range(idx, size - 1):
+                        buf[k] = buf[k + 1]
+                    size -= 1
+
+            # --- add incoming column ---
+            for yy in range(y, y + wy):
+                v = padded[yy, x - 1 + wx]
+                if not np.isnan(v):
+                    idx = _binary_search_numba(buf, size, v)
+                    # shift to make room
+                    for k in range(size, idx, -1):
+                        buf[k] = buf[k - 1]
+                    buf[idx] = v
+                    size += 1
+
+            out[y, x] = _compute_median_numba(buf, size)
+
+    return out
+
+
+
+def nanmedian_filter_numba(data, window):
+    """
+    NaN-aware median filter using a Numba-accelerated sliding window.
+    Matches generic_filter(np.nanmedian, mode="constant", cval=np.nan).
+    """
+
+    # Handle xarray input
+    if isinstance(data, xr.DataArray):
+        arr = data.values[0]
+    else:
+        arr = np.asarray(data)
+
+    H, W = arr.shape
+
+    if isinstance(window, int):
+        wy = wx = window
+    else:
+        wy, wx = window
+
+    pad_y = wy // 2
+    pad_x = wx // 2
+
+    padded = np.pad(arr,
+                    ((pad_y, pad_y), (pad_x, pad_x)),
+                    mode="constant",
+                    constant_values=np.nan)
+
+    out = _nanmedian_filter_kernel_numba(padded, H, W, wy, wx)
+
+    # Preserve original NaNs
+    mask = np.isfinite(arr)
+    return np.where(mask, out, np.nan)
+
+
+
+def local_standardization_m_mad_numba(da, window=11, eps=0, scaling_factor=1.4826):
+    """
+    Modified MAD standardization using Numba-accelerated median filter.
+     - Local standardization using local median and local modified MAD (median of absolute deviations from local median).
+     - Uses nanmedian_filter_numba for both median and MAD calculations.
+     - Preserves NaNs in the output.
+     - Accepts either xarray.DataArray or numpy.ndarray as input.
+     - Returns an array with the same shape as input, where each value is standardized based on its local neighborhood defined by the window.
+     - eps added to denominator for numerical stability.
+     - Scaling factor 1.4826 applied to MAD to convert to sigma-equivalent for normal data (check if appropriate for modified MAD).
+    """
+    # accept either DataArray or ndarray
+    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    # keep NaNs as NaNs for median/MAD
+    mask = np.isfinite(data)
+    data_nan = np.where(mask, data, np.nan)
+
+    # local median
+    local_median = nanmedian_filter_numba(data_nan, window=window)
+
+    # deviations from local medians
+    abs_dev = np.abs(data_nan - local_median)
+
+    # Local modified MAD: median of absolute deviations from local median
+    local_m_mad = nanmedian_filter_numba(abs_dev, window=window)
+
+    # convert MAD to sigma-equivalent for normal data 
+    # TODO check if this is the right scaling factor for modified MAD
+    robust_std = scaling_factor * local_m_mad
+
+    standardized = (data - local_median) / (robust_std + eps)
+    standardized = np.where(mask, standardized, np.nan)
+
+    return standardized
 
 
 
@@ -859,10 +1176,11 @@ def scea_interactive(
         lon, lat, value,  
         windows_list = [9, 11, 13, 15, 21, 31, 51, 101, 151, 201, 301, 501],
         wind_data=None,
+        use_numba=True,
 ):
-
+    
     # Interactive multi-scale sliders + optional SCEA run (extended with per-scale denoise)
-    from ipywidgets import IntSlider, FloatSlider, Button, HBox, Layout, VBox, Output, Dropdown, Checkbox, FloatText, IntText, Label, AppLayout
+    from ipywidgets import IntSlider, FloatSlider, Button, HBox, Layout, VBox, Output, Dropdown, Checkbox, FloatText, IntText, Label, AppLayout, BoundedFloatText
     import ipywidgets as widgets
     import matplotlib.pyplot as plt
     from IPython.display import display
@@ -873,7 +1191,6 @@ def scea_interactive(
     full_desc = {"description_width": "initial"}
     scea_parameters_layout_float = Layout(width='160px')  # top and bottom margin for spacing
     scea_parameters_layout_int = Layout(width='180px')  # top and bottom margin for spacing
-
 
     out = Output()
     #last = {"combined": None, "clusters": None}
@@ -890,6 +1207,10 @@ def scea_interactive(
         layout=Layout(width='240px')
     )
 
+    std_type_options = [("standardization", "standard"), ("median_MAD", "median_mad")]
+    std_type_small  = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
+    std_type_medium = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
+    std_type_large  = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
 
     # --- scale/window controls ---
     w_small = Dropdown(options=windows_list, value=9, description="window_s", layout=less_compact_layout)
@@ -901,10 +1222,10 @@ def scea_interactive(
     c_large = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
 
 
-    use_small = Checkbox(value=True, description="SMALL WINDOW")
-    use_medium = Checkbox(value=True, description="MEDIUM WINDOW")
-    use_large = Checkbox(value=True, description="LARGE WINDOW")
-    use_raw = Checkbox(value=False, description="RAW DATA")
+    use_small = Checkbox(value=True, description="SMALL WINDOW", layout=Layout(width='220px'))
+    use_medium = Checkbox(value=True, description="MEDIUM WINDOW", layout=Layout(width='220px'))
+    use_large = Checkbox(value=True, description="LARGE WINDOW", layout=Layout(width='220px'))
+    use_raw = Checkbox(value=False, description="RAW DATA", layout=Layout(width='220px'))
 
     # --- per-scale pre-denoise controls ---
     denoise_pre_small = Checkbox(value=False, description="denoise_pre", layout=Layout(width='210px'))
@@ -939,6 +1260,7 @@ def scea_interactive(
         description='OVERLAY: ',
         layout=Layout(width='240px')
     )
+    vmax_q = BoundedFloatText(value=0.999, min=0.0, max=1.0, step=0.001, description="vmax_q", layout=Layout(width="145px"))
 
 
     # --- raw data controls ---
@@ -975,15 +1297,13 @@ def scea_interactive(
 
     overlay_wind_arrows = Checkbox(value=False, description="overlay wind arrows", layout=Layout(width='230px'))
 
-
-
-
     def apply_denoise(arr, sigma=1.5):
         return nan_gaussian_filter(arr, sigma=float(sigma))
 
-    def get_local_standardization(window, denoise_pre_flag, sigma_pre_val, denoise_post_flag, sigma_post_val):
+    def get_local_standardization(window, std_type_val, denoise_pre_flag, sigma_pre_val, denoise_post_flag, sigma_post_val):
         key = (
             int(window),
+            str(std_type_val),
             bool(denoise_pre_flag),
             round(float(sigma_pre_val), 3),
             bool(denoise_post_flag),
@@ -999,8 +1319,14 @@ def scea_interactive(
             base = apply_denoise(base, sigma=sigma_pre_val)
         
         # Standardize
-        arr = np.asarray(xr_local_standardization(base, window=int(window)))
-        
+        if std_type_val == "median_mad":
+            if use_numba:
+                arr = np.asarray(local_standardization_m_mad_numba(base, window=int(window)))
+            else:
+                arr = np.asarray(local_standardization_m_mad(base, window=int(window)))
+        else:
+            arr = np.asarray(local_standardization(base, window=int(window)))
+
         # Post-denoise
         if denoise_post_flag:
             arr = apply_denoise(arr, sigma=sigma_post_val)
@@ -1011,17 +1337,17 @@ def scea_interactive(
 
     def render_combined():
         s = get_local_standardization(
-            w_small.value, 
+            w_small.value, std_type_small.value,
             denoise_pre_small.value, sigma_pre_small.value,
             denoise_post_small.value, sigma_post_small.value
         )
         m = get_local_standardization(
-            w_med.value,
+            w_med.value, std_type_medium.value,
             denoise_pre_medium.value, sigma_pre_medium.value,
             denoise_post_medium.value, sigma_post_medium.value
         )
         l = get_local_standardization(
-            w_large.value,
+            w_large.value, std_type_large.value,
             denoise_pre_large.value, sigma_pre_large.value,
             denoise_post_large.value, sigma_post_large.value
         )
@@ -1049,17 +1375,17 @@ def scea_interactive(
 
         # Get standardized data for each scale
         s = get_local_standardization(
-            w_small.value,
+            w_small.value, std_type_small.value,
             denoise_pre_small.value, sigma_pre_small.value,
             denoise_post_small.value, sigma_post_small.value
         )
         m = get_local_standardization(
-            w_med.value,
+            w_med.value, std_type_medium.value,
             denoise_pre_medium.value, sigma_pre_medium.value,
             denoise_post_medium.value, sigma_post_medium.value
         )
         l = get_local_standardization(
-            w_large.value,
+            w_large.value, std_type_large.value,
             denoise_pre_large.value, sigma_pre_large.value,
             denoise_post_large.value, sigma_post_large.value
         )
@@ -1090,7 +1416,7 @@ def scea_interactive(
                 pcm = ax.pcolormesh(
                     lon, lat, display_data,
                     shading="auto",
-                    vmax=np.nanquantile(display_data[~np.isnan(display_data)], 0.999),
+                    vmax=np.nanquantile(display_data[~np.isnan(display_data)], q=float(vmax_q.value)),
                     transform=ccrs.PlateCarree(),
                     cmap="cmc.batlow"
                 )
@@ -1215,18 +1541,20 @@ def scea_interactive(
     # Register all widget observers BEFORE initial display
     for widget in (
         w_small, w_med, w_large, c_small, c_med, c_large,
+        std_type_small, std_type_medium, std_type_large,
         use_small, use_medium, use_large, use_raw,
         denoise_pre_small, denoise_pre_medium, denoise_pre_large,
         sigma_pre_small, sigma_pre_medium, sigma_pre_large,
         denoise_post_small, denoise_post_medium, denoise_post_large,
         sigma_post_small, sigma_post_medium, sigma_post_large,
         denoise_raw, sigma_raw, c_raw,
-        use_wind, wind_level, wind_scale_method, wind_scale_param
+        use_wind, wind_level, wind_scale_method, wind_scale_param,
     ):
         widget.observe(mark_clusters_stale, names="value")
 
     # Overlay and cluster visibility changes
     overlay_option.observe(update_plot, names="value")
+    vmax_q.observe(update_plot, names="value")
     show_clusters.observe(update_plot, names="value")
     overlay_wind_arrows.observe(update_plot, names="value")
     cluster_select.observe(update_plot, names="value")
@@ -1260,7 +1588,7 @@ def scea_interactive(
         border="1px solid gray",
         padding="0px 0px",
         margin="0",
-        width="265px",      # shrink section to children
+        width="285px",      # shrink section to children
         align_items="flex-end",
     )
     scales_row_layout = Layout(
@@ -1279,34 +1607,34 @@ def scea_interactive(
         Label("DATA PRE-PROCESSING: Adaptive standardization with multiple scales and optional denoising", layout=Layout(padding="0px 0px 0px 5px")),
         HBox([
             VBox([
-                HBox([use_small], layout=row_layout),
+                HBox([use_small, std_type_small], layout=row_layout),
                 HBox([denoise_pre_small, sigma_pre_small], layout=row_layout),
                 HBox([w_small, c_small], layout=row_layout),
                 HBox([denoise_post_small, sigma_post_small], layout=row_layout),
             ], layout=section_layout),
             VBox([
-                HBox([use_medium], layout=row_layout),
+                HBox([use_medium, std_type_medium], layout=row_layout),
                 HBox([denoise_pre_medium, sigma_pre_medium], layout=row_layout),
                 HBox([w_med, c_med], layout=row_layout),
                 HBox([denoise_post_medium, sigma_post_medium], layout=row_layout),
             ], layout=section_layout),
             VBox([
-                HBox([use_large], layout=row_layout),
+                HBox([use_large, std_type_large], layout=row_layout),
                 HBox([denoise_pre_large, sigma_pre_large], layout=row_layout),
                 HBox([w_large, c_large], layout=row_layout),
                 HBox([denoise_post_large, sigma_post_large], layout=row_layout),
             ], layout=section_layout),
             VBox([
                 HBox([use_raw], layout=row_layout),
-                HBox([denoise_raw, sigma_raw], layout=row_layout),
-                HBox([Label("")], layout=row_layout),  # spacer to align with window rows
+                HBox([denoise_raw], layout=row_layout),
+                HBox([sigma_raw], layout=row_layout),  # spacer to align with window rows
                 HBox([c_raw], layout=row_layout),
-            ], layout=section_layout),
+            ], layout=Layout(border="1px solid gray",padding="0px 0px",margin="0",width="155px",align_items="flex-end",)),
         ], layout=scales_row_layout),
 
         HBox([scea_label, growth_limit_w, detection_limit_w, local_box_size_w, max_pts_start_radius_w, run_btn], layout=parameters_layout),
         HBox([use_wind, wind_level, wind_scale_method, wind_scale_param], layout=parameters_layout),
-        HBox([overlay_option, show_clusters, cluster_select, overlay_wind_arrows ], layout=Layout(padding="15px")),
+        HBox([overlay_option, vmax_q, show_clusters, cluster_select, overlay_wind_arrows], layout=Layout(padding="10px", display='flex', flex_flow='row wrap', align_items='center', justify_content='flex-start', gap='0px')),
     ], layout=controls_layout)
 
     # Display UI and initial plot
