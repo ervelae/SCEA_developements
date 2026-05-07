@@ -1,3 +1,4 @@
+import os
 from time import time
 import numpy as np
 from collections import OrderedDict
@@ -11,6 +12,11 @@ import colorcet as cc
 import xarray as xr
 from numba import njit, prange
 import bisect
+from shapely.geometry import Point
+import geopandas as gpd
+from haversine import haversine_vector, Unit
+from scipy.spatial import KDTree
+import pandas as pd
 
 
 # --- Custom distance metric: directed half-ellipse ---
@@ -516,6 +522,7 @@ def scea(
     row_cache_max_rows=256,
     symmetric_cross_fill=False,
     verbose=True,
+    tqdm=None,
 ):
     """
     SCEA using a cache of distance matrix rows for efficient calculations.
@@ -523,6 +530,11 @@ def scea(
     - Per seed: builds local set, binds a row-getter to that set, grows cluster.
     - Stores rows only for radiating points (and only columns used so far).
     """
+
+    if verbose >= 1:
+        print(f"[Init] Starting SCEA with {len(values)} points.")
+    if tqdm is not None:
+        tqdm.set_description(f"   [Init] Starting SCEA with {len(values)} points.")
 
     # Turn to numpy arrays
     coords = np.asarray(coords)
@@ -588,7 +600,7 @@ def scea(
     if verbose >= 1:
         print(f"[Start] SCEA: metric={metric}, growth_limit={growth_limit}, detection_limit={detection_limit}, local_box_size={local_box_size}, max_pts_start_radius={max_pts_start_radius}, n_clusters={n_clusters}")
         # Time the execution
-        start_time = time()
+    start_time = time()
 
 
     # --- Instantiate a lightweight row cache (global over the whole run) ---
@@ -670,7 +682,8 @@ def scea(
                   f"Seed coords & value: {local_coords[np.argmax(local_values)]}, {active_values.max():.6f} | ")
         if verbose == 1:
             print(f"\r[{cluster_id - 1}] Cluster formed. | current max value: {active_values.max():.7f} | stopping threshold: {point_value_threshold:.7f}", end='', flush=True)
-
+        if tqdm is not None:
+            tqdm.set_description(f"  [{cluster_id - 1}] Cluster formed. | current max value: {active_values.max():.7f} | stopping threshold: {point_value_threshold:.7f}")
 
         cluster_id += 1
 
@@ -679,12 +692,14 @@ def scea(
                 print(f"\n[Stop] Reached n_clusters={n_clusters}.")
             break
 
+    end_time = time()
     if verbose >= 2:
         print("[Stats]" + row_cache.stats_summary())
         print_cluster_stats(clusters, values)
     if verbose >= 1:
-        end_time = time()
         print(f"[Done] Total clusters found: {cluster_id - 1}, Time taken: {end_time - start_time:.2f} seconds")
+    if tqdm is not None:
+        tqdm.set_description(f"  [Done] Total clusters found: {cluster_id - 1}, Time taken: {end_time - start_time:.2f} seconds")
 
     # Reinsert NaN points as cluster 0 (unclustered)
     if nan_mask.any():
@@ -722,40 +737,13 @@ def scea(
 
 
 
-
-# =========================== SCEA helper functions and utils (preprocessing, etc.) ============================ #
+# ====================================================================================
+# SCEA helper functions and utils (preprocessing, etc.)
+# ====================================================================================
 
 
 from scipy.ndimage import gaussian_filter, generic_filter, uniform_filter
 import xarray as xr
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-
-
-def nan_gaussian_filter(data, sigma=1.0, mode="nearest"):
-    """
-    Applies a Gaussian filter to data that may contain NaNs, treating NaNs as missing values and not letting them contribute to the smoothing of valid data. 
-    The output will have NaN in any position where the original data had NaN, and valid smoothed values elsewhere.
-
-    """
-    mask = np.isfinite(data).astype(float)
-    
-    # Fill NaNs with zeros for convolution; the mask will correct for this later.
-    data_filled = np.where(np.isfinite(data), data, 0.0)
-
-    # Apply Gaussian filter to both the filled data
-    ## The result will be biased low near NaNs(=0.0), but we will correct for that using the weights from the mask.
-    smooth = gaussian_filter(data_filled, sigma=sigma, mode=mode)
-
-    # Apply Gaussian filter to the mask to get the effective weights (sum of kernel over valid points)
-    ## If a point has NaN neighbors, the weight will be less than 1, and we can use this to correct the smoothed value.
-    weight = gaussian_filter(mask, sigma=sigma, mode=mode) 
-
-    # Avoid division by zero: where weight is zero, we set the result to NaN (since it means there were no valid points contributing to the smooth value).
-    result = np.where(weight > 0, smooth / weight, np.nan)
-
-    # Finally, we also want to ensure that any point that was originally NaN remains NaN in the output, even if the smoothed value is non-NaN due to neighboring values.
-    return np.where(mask > 0, result, np.nan)
 
 
 
@@ -824,9 +812,9 @@ def match_era5_wind_to_tropomi(tropomi_data, era5_data, era5_variables=['wind_ma
     # Select the nearest ERA5 grid point for each TROPOMI point in space and time, and extract the specified wind variables.
     for var in era5_variables:
         wind_data[var] = era5_data[var].sel(
-            latitude=tropomi_data.latitude[0],
-            longitude=tropomi_data.longitude[0],
-            time=tropomi_data.time_utc[0].broadcast_like(tropomi_data["longitude"][0]),
+            latitude=tropomi_data.latitude,
+            longitude=tropomi_data.longitude,
+            time=tropomi_data.time_utc.broadcast_like(tropomi_data["longitude"][0]),
             method="nearest",
         )
     
@@ -850,6 +838,142 @@ def scale_wind_magnitude_for_distance_matrix(wind_magnitudes, method="linear", p
     else:
         raise ValueError("Unknown scaling method")
     
+
+
+
+
+# ==== Data preprocessing utilities ====
+
+# Crop TROPOMI dataset to given bbox
+def crop_to_bbox(
+    ds, 
+    bbox: list[float] = [-10.0, 35.0, 30.0, 70.0],  # [min_lon, min_lat, max_lon, max_lat]
+    save_path: str = None,
+    variable_names = None,
+    verbose: bool = True
+) -> xr.Dataset:
+    """
+    Crop xarray Dataset to given bbox.
+    """
+
+    if type(ds) is not xr.Dataset:
+        ds = xr.open_dataset(ds, group="PRODUCT", mask_and_scale=True)
+
+    if verbose:
+        print("[+] Cropping data files.")
+
+    if variable_names is None:
+        variable_names = {"lon": "longitude", "lat": "latitude", "value": "nitrogendioxide_tropospheric_column"}
+
+    if ds[variable_names["value"]].ndim == 3:
+        lon = ds[variable_names["lon"]][0].data
+        lat = ds[variable_names["lat"]][0].data
+    else:
+        lon = ds[variable_names["lon"]].data
+        lat = ds[variable_names["lat"]].data
+
+
+    # Mask for points inside bbox
+    in_bbox = (lon >= bbox[0]) & (lon <= bbox[2]) & \
+                (lat >= bbox[1]) & (lat <= bbox[3])
+
+    ds_crop = None
+
+    if np.any(in_bbox):
+
+        # Find valid rows/cols (at least one point in bbox)
+        valid_rows = np.any(in_bbox, axis=1)
+        valid_cols = np.any(in_bbox, axis=0)
+
+        in_bbox = in_bbox[valid_rows, :][:, valid_cols]
+
+        ds_crop = ds.isel(scanline=valid_rows, ground_pixel=valid_cols)
+
+        for vars in ds_crop.variables:
+            if (("scanline" in ds_crop[vars].coords) 
+                and ("ground_pixel" in ds_crop[vars].coords) 
+                and (ds_crop[vars].shape == in_bbox.shape) 
+                and (vars not in ["time", "latitude", "longitude", "time_utc"])
+                ):
+                #print("[+] Found 'scanline' and 'ground_pixel' coordinates in", vars)
+                # Turn values outside bbox to NaN
+                ds_crop[vars] = ds_crop[vars].where(in_bbox)
+
+    else:
+        if verbose:
+            print(f"[-] No data in bbox for file")
+
+
+    if save_path:
+        ds_crop.to_netcdf(save_path, group="PRODUCT")
+        if verbose:
+            print(f"[+] Saved cropped dataset to {save_path}")
+
+    return ds_crop
+
+
+def quality_filter(ds, qa_var="qa_value", value_var="nitrogendioxide_tropospheric_column", threshold=0.75, verbose=True):
+    """
+    Filter xarray Dataset based on quality assurance variable.
+    """
+    if qa_var not in ds:
+        print(f"[-] QA variable '{qa_var}' not found in dataset. Skipping quality filtering.")
+        return ds
+
+    if verbose: print(f"[+] Applying quality filter: {qa_var} >= {threshold}")
+    mask = ds[qa_var] >= threshold
+    ds[value_var] = ds[value_var].where(mask)
+
+    if verbose:
+        total_points = ds[qa_var].size
+        valid_points = mask.sum().item()
+        print(f"[+] Quality filter applied. Valid points: {valid_points}/{total_points} ({(valid_points/total_points)*100:.2f}%)")
+    return ds
+
+
+def discard_files_smaller_than(data, variable_name, min_valid_points=20, verbose=True):
+    """
+    Discard xarray Datasets that have fewer than min_valid_points valid (non-NaN) data points in the main variable of interest.
+    """
+    #if verbose: print(f"[+] Discarding files with fewer than {min_valid_points} valid points.")
+    valid_points = np.sum(np.isfinite(data[variable_name].values))
+    if valid_points < min_valid_points:
+        if verbose: print(f"[-] Discarding file with only {valid_points} valid points.")
+        return None
+    else:
+        if verbose: print(f"[+] Keeping file with {valid_points} valid points.")
+        return data
+
+
+
+
+
+# ==== NaN-aware filters for smoothing and local standardization ====
+
+def nan_gaussian_filter(data, sigma=1.0, mode="nearest"):
+    """
+    Applies a Gaussian filter to data that may contain NaNs, treating NaNs as missing values and not letting them contribute to the smoothing of valid data. 
+    The output will have NaN in any position where the original data had NaN, and valid smoothed values elsewhere.
+
+    """
+    mask = np.isfinite(data).astype(float)
+    
+    # Fill NaNs with zeros for convolution; the mask will correct for this later.
+    data_filled = np.where(np.isfinite(data), data, 0.0)
+
+    # Apply Gaussian filter to both the filled data
+    ## The result will be biased low near NaNs(=0.0), but we will correct for that using the weights from the mask.
+    smooth = gaussian_filter(data_filled, sigma=sigma, mode=mode)
+
+    # Apply Gaussian filter to the mask to get the effective weights (sum of kernel over valid points)
+    ## If a point has NaN neighbors, the weight will be less than 1, and we can use this to correct the smoothed value.
+    weight = gaussian_filter(mask, sigma=sigma, mode=mode) 
+
+    # Avoid division by zero: where weight is zero, we set the result to NaN (since it means there were no valid points contributing to the smooth value).
+    result = np.divide(smooth, weight, where=(weight > 0), out=np.full_like(smooth, np.nan))
+
+    # Finally, we also want to ensure that any point that was originally NaN remains NaN in the output, even if the smoothed value is non-NaN due to neighboring values.
+    return np.where(mask > 0, result, np.nan)
 
 
 def local_standardization(da, window=11, eps=1e-12):
@@ -895,8 +1019,7 @@ def local_standardization(da, window=11, eps=1e-12):
     return standardized
 
 
-
-def nanmedian_filter_exact(data, window):
+def nanmedian_filter(data, window):
     """
     NaN-aware median filter matching:
         scipy.ndimage.generic_filter(..., np.nanmedian, mode="constant", cval=np.nan)
@@ -980,37 +1103,6 @@ def nanmedian_filter_exact(data, window):
 
 
 
-def local_standardization_m_mad(da, window=11, eps=0, scaling_factor=1.4826):
-    """
-    Modified MAD standardization
-    Local standardization using local median and local modified MAD (median of absolute deviations from local median).
-    """
-    # accept either DataArray or ndarray
-    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
-
-    # keep NaNs as NaNs for median/MAD
-    mask = np.isfinite(data)
-    data_nan = np.where(mask, data, np.nan)
-
-    # local median
-    local_median = nanmedian_filter_exact(data_nan, window=window)
-
-    # deviations from local medians
-    abs_dev = np.abs(data_nan - local_median)
-
-    # Local modified MAD: median of absolute deviations from local median
-    local_m_mad = nanmedian_filter_exact(abs_dev, window=window)
-
-    # convert MAD to sigma-equivalent for normal data 
-    # TODO check if this is the right scaling factor for modified MAD
-    robust_std = scaling_factor * local_m_mad
-
-    standardized = (data - local_median) / (robust_std + eps)
-    standardized = np.where(mask, standardized, np.nan)
-
-    return standardized
-
-
 @njit
 def _binary_search_numba(arr, size, val):
     """Return insertion index for val in sorted arr[:size]."""
@@ -1024,7 +1116,6 @@ def _binary_search_numba(arr, size, val):
             hi = mid
     return lo
 
-
 @njit
 def _compute_median_numba(buf, size):
     if size == 0:
@@ -1034,7 +1125,6 @@ def _compute_median_numba(buf, size):
         return buf[mid]
     else:
         return 0.5 * (buf[mid - 1] + buf[mid])
-
 
 @njit(parallel=True)
 def _nanmedian_filter_kernel_numba(padded, H, W, wy, wx):
@@ -1092,7 +1182,6 @@ def _nanmedian_filter_kernel_numba(padded, H, W, wy, wx):
     return out
 
 
-
 def nanmedian_filter_numba(data, window):
     """
     NaN-aware median filter using a Numba-accelerated sliding window.
@@ -1129,16 +1218,15 @@ def nanmedian_filter_numba(data, window):
 
 
 def local_standardization_m_mad_numba(da, window=11, eps=0, scaling_factor=1.4826):
+    return local_standardization_m_mad(da, window=window, eps=eps, scaling_factor=scaling_factor, use_numba=True)
+
+
+def local_standardization_m_mad(da, window=11, eps=0, scaling_factor=1.4826, use_numba=True):
     """
-    Modified MAD standardization using Numba-accelerated median filter.
-     - Local standardization using local median and local modified MAD (median of absolute deviations from local median).
-     - Uses nanmedian_filter_numba for both median and MAD calculations.
-     - Preserves NaNs in the output.
-     - Accepts either xarray.DataArray or numpy.ndarray as input.
-     - Returns an array with the same shape as input, where each value is standardized based on its local neighborhood defined by the window.
-     - eps added to denominator for numerical stability.
-     - Scaling factor 1.4826 applied to MAD to convert to sigma-equivalent for normal data (check if appropriate for modified MAD).
+    Modified MAD standardization
+    Local standardization using local median and local modified MAD (median of absolute deviations from local median).
     """
+
     # accept either DataArray or ndarray
     data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
 
@@ -1147,27 +1235,1004 @@ def local_standardization_m_mad_numba(da, window=11, eps=0, scaling_factor=1.482
     data_nan = np.where(mask, data, np.nan)
 
     # local median
-    local_median = nanmedian_filter_numba(data_nan, window=window)
+    if use_numba:
+        local_median = nanmedian_filter_numba(data_nan, window=window)
+    else:
+        local_median = nanmedian_filter(data_nan, window=window)
 
     # deviations from local medians
     abs_dev = np.abs(data_nan - local_median)
 
     # Local modified MAD: median of absolute deviations from local median
-    local_m_mad = nanmedian_filter_numba(abs_dev, window=window)
+    if use_numba:
+        local_m_mad = nanmedian_filter_numba(abs_dev, window=window)
+    else:
+        local_m_mad = nanmedian_filter(abs_dev, window=window)
 
     # convert MAD to sigma-equivalent for normal data 
     # TODO check if this is the right scaling factor for modified MAD
     robust_std = scaling_factor * local_m_mad
 
-    standardized = (data - local_median) / (robust_std + eps)
-    standardized = np.where(mask, standardized, np.nan)
+    standardized = np.divide(
+        data - local_median, 
+        robust_std + eps, 
+        where=(robust_std + eps > 0), 
+        out=np.full_like(data, np.nan)
+    )    
+    standardized = np.where(np.isfinite(standardized), standardized, np.nan)
 
     return standardized
 
 
+@njit
+def _nanmad_filter_kernel_numba(padded, H, W, wy, wx):
+    """
+    Compute MAD (Median Absolute Deviation) at each point.
+    For each window centered at (y, x):
+      1. Collect finite values in the window
+      2. Compute the window's median
+      3. Compute median of absolute deviations from that median
+    """
+    out = np.empty((H, W), dtype=np.float64)
+    maxk = wy * wx
+
+    # ---------- PARALLEL ROW PROCESSING ----------
+    for y in prange(H):
+
+        # Thread-private working buffers
+        values_buf = np.empty(maxk, dtype=np.float64)  # sorted values in window
+        abs_dev_buf = np.empty(maxk, dtype=np.float64)  # sorted abs deviations
+        size = 0
+
+        # ---- INITIAL WINDOW (x=0) ----
+        # Collect finite values from initial window
+        size = 0
+        for yy in range(y, y + wy):
+            for xx in range(0, wx):
+                v = padded[yy, xx]
+                if not np.isnan(v):
+                    idx = _binary_search_numba(values_buf, size, v)
+                    # shift right
+                    for k in range(size, idx, -1):
+                        values_buf[k] = values_buf[k - 1]
+                    values_buf[idx] = v
+                    size += 1
+
+        # Compute MAD for initial window
+        if size > 0:
+            # Compute median of this window
+            mid = size // 2
+            if size % 2 == 1:
+                window_median = values_buf[mid]
+            else:
+                window_median = 0.5 * (values_buf[mid - 1] + values_buf[mid])
+            
+            # Compute absolute deviations and their median
+            abs_dev_size = 0
+            for k in range(size):
+                dev = np.abs(values_buf[k] - window_median)
+                idx = _binary_search_numba(abs_dev_buf, abs_dev_size, dev)
+                # shift right
+                for m in range(abs_dev_size, idx, -1):
+                    abs_dev_buf[m] = abs_dev_buf[m - 1]
+                abs_dev_buf[idx] = dev
+                abs_dev_size += 1
+            
+            out[y, 0] = _compute_median_numba(abs_dev_buf, abs_dev_size)
+        else:
+            out[y, 0] = np.nan
+
+        # ---- SLIDE HORIZONTALLY ----
+        for x in range(1, W):
+
+            # --- remove outgoing column (xx=0) ---
+            for yy in range(y, y + wy):
+                v = padded[yy, x - 1]
+                if not np.isnan(v):
+                    idx = _binary_search_numba(values_buf, size, v)
+                    # remove at idx
+                    for k in range(idx, size - 1):
+                        values_buf[k] = values_buf[k + 1]
+                    size -= 1
+
+            # --- add incoming column (xx=wx-1) ---
+            for yy in range(y, y + wy):
+                v = padded[yy, x - 1 + wx]
+                if not np.isnan(v):
+                    idx = _binary_search_numba(values_buf, size, v)
+                    # shift to make room
+                    for k in range(size, idx, -1):
+                        values_buf[k] = values_buf[k - 1]
+                    values_buf[idx] = v
+                    size += 1
+
+            # Compute MAD for this window
+            if size > 0:
+                # Compute median of this window
+                mid = size // 2
+                if size % 2 == 1:
+                    window_median = values_buf[mid]
+                else:
+                    window_median = 0.5 * (values_buf[mid - 1] + values_buf[mid])
+                
+                # Compute absolute deviations and their median
+                abs_dev_size = 0
+                for k in range(size):
+                    dev = np.abs(values_buf[k] - window_median)
+                    idx = _binary_search_numba(abs_dev_buf, abs_dev_size, dev)
+                    # shift right
+                    for m in range(abs_dev_size, idx, -1):
+                        abs_dev_buf[m] = abs_dev_buf[m - 1]
+                    abs_dev_buf[idx] = dev
+                    abs_dev_size += 1
+                
+                out[y, x] = _compute_median_numba(abs_dev_buf, abs_dev_size)
+            else:
+                out[y, x] = np.nan
+
+    return out
+
+
+def nanmad_filter_numba(data, window):
+    """
+    NaN-aware MAD (Median Absolute Deviation) filter using Numba acceleration.
+    For each point's neighborhood, computes the MAD as:
+      1. Median of values in the window
+      2. Median of absolute deviations from that median
+    """
+    # Handle xarray input
+    if isinstance(data, xr.DataArray):
+        arr = data.values[0]
+    else:
+        arr = np.asarray(data)
+
+    H, W = arr.shape
+
+    if isinstance(window, int):
+        wy = wx = window
+    else:
+        wy, wx = window
+
+    pad_y = wy // 2
+    pad_x = wx // 2
+
+    padded = np.pad(arr,
+                    ((pad_y, pad_y), (pad_x, pad_x)),
+                    mode="constant",
+                    constant_values=np.nan)
+
+    out = _nanmad_filter_kernel_numba(padded, H, W, wy, wx)
+
+    # Preserve original NaNs
+    mask = np.isfinite(arr)
+    return np.where(mask, out, np.nan)
+
+
+def local_standardization_mad_numba(da, window=11, eps=0, scaling_factor=1.4826):
+    return local_standardization_mad(da, window=window, eps=eps, scaling_factor=scaling_factor, use_numba=True)
+
+
+def local_standardization_mad(da, window=11, eps=0, scaling_factor=1.4826, use_numba=True):
+    """
+    Standard MAD standardization using Numba-accelerated window processing.
+     - Local standardization using local median and local MAD (median of absolute deviations from each window's median).
+     - Uses nanmad_filter_numba for efficient MAD calculations.
+     - Preserves NaNs in the output.
+     - Accepts either xarray.DataArray or numpy.ndarray as input.
+     - Returns an array with the same shape as input, where each value is standardized based on its local neighborhood defined by the window.
+     - eps added to denominator for numerical stability.
+     - Scaling factor 1.4826 applied to MAD to convert to sigma-equivalent for normal data.
+     - This is the "standard" (not "modified") MAD: MAD is computed independently for each window.
+    """
+    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    mask = np.isfinite(data)
+    data_nan = np.where(mask, data, np.nan)
+
+    # local median
+    if use_numba:
+        local_median = nanmedian_filter_numba(data_nan, window=window)
+    else:
+        local_median = nanmedian_filter(data_nan, window=window)
+
+    # local MAD
+    if use_numba:
+        local_mad = nanmad_filter_numba(data_nan, window=window)
+    else:
+        def mad_func(window_values):
+            m = np.nanmedian(window_values)
+            return np.nanmedian(np.abs(window_values - m))
+
+        local_mad = generic_filter(
+            data_nan, mad_func, size=window, mode="constant", cval=np.nan
+        )
+
+    robust_std = scaling_factor * local_mad
+
+    standardized = (data_nan - local_median) / (robust_std + eps)
+
+    return np.where(np.isfinite(standardized), standardized, np.nan)
+
+
+def denoise_butterworth(data, cutoff=40, order=2):
+    """Applies a Butterworth low-pass filter to the data. This can help to reduce high-frequency noise
+    
+    """
+    from numpy.fft import fft2, ifft2, fftshift, ifftshift
+
+    # TODO make suitable for inputs with very different aspect ratios by allowing different cutoff frequencies for x and y dimensions, and adjusting the kernel accordingly.
+    def butterworth_lowpass_kernel(shape, cutoff, order=2):
+        ny, nx = shape
+        cy, cx = ny // 2, nx // 2
+        Y, X = np.ogrid[:ny, :nx]
+        D = np.sqrt((Y - cy)**2 + (X - cx)**2)
+        
+        H = 1 / (1 + (D / cutoff)**(2 * order))
+        return H
+    
+    # accept either DataArray or ndarray
+    #data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    mask = np.isfinite(data)
+    data_filled = np.where(mask, data, 0.0)
+
+
+    kernel = butterworth_lowpass_kernel(data.shape, cutoff, order)
+    data_fft = fft2(data_filled)
+    data_fft_shifted = fftshift(data_fft)
+    filtered_fft = data_fft_shifted * kernel
+    data_filtered = np.real(ifft2(ifftshift(filtered_fft)))
+
+    return np.where(mask, data_filtered, np.nan)
+    
+    
+
+
+def combine_standardizations(da, standardizations, coefficients):
+    """
+    Combines multiple standardized arrays using weighted coefficients.
+    """
+    # TODO
+    raise NotImplementedError("combine_standardizations not implemented yet")
 
 
 
+# ==== Wrapper for preprocessing methods ====
+def preprocess_data_xr(da, method=None, kwargs=None, variable_names=None, verbose=False):
+    """
+    
+    """
+    if kwargs is None:
+        kwargs = {}
+    
+    if method == "local_standardization":
+        da[variable_names["value"]].values = local_standardization(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "local_standardization_mad":
+        da[variable_names["value"]].values = local_standardization_mad(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "local_standardization_m_mad":
+        da[variable_names["value"]].values = local_standardization_m_mad(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "combine_standardizations":
+        da[variable_names["value"]].values = combine_standardizations(da[variable_names["value"]].values, **kwargs) # TODO implement
+        return da
+    elif method == "denoise_butterworth":
+        da[variable_names["value"]].values = denoise_butterworth(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "nan_gaussian_filter":
+        da[variable_names["value"]].values = nan_gaussian_filter(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "crop_to_bbox":
+        return crop_to_bbox(da, **kwargs, variable_names=variable_names, verbose=verbose)
+    elif method == "quality_filter":
+        return quality_filter(da, qa_var=variable_names["quality"], value_var=variable_names["value"], verbose=verbose, **kwargs)
+    elif method == "discard_small_files":
+        return discard_files_smaller_than(da, variable_name=variable_names["value"], verbose=verbose, **kwargs)
+    elif method == "regrid_with_harp": 
+        raise NotImplementedError("regrid_with_harp method not implemented yet")
+    elif method == "quality_filter":
+        raise NotImplementedError("quality_filter method not implemented yet")
+    else:
+        raise ValueError(f"Unknown preprocessing method: {method}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================================
+#  Cluster analysis utilities
+# =============================================
+
+def clusters_plume_id(clusters, file_id, ignore_zero=True) -> np.ndarray:
+    """
+    Generate plume IDs for each cluster in the clusters array. 
+    The plume IDs are generated by concatenating the file_id with a cluster number (starting from 1 if ignore_zero is True, otherwise starting from 0). 
+    """
+    if ignore_zero: first_index = 1
+    else: first_index = 0
+
+    return file_id + "_c" + np.array(range(first_index, int(np.nanmax(clusters))+1), dtype=str) 
+
+
+def clusters_plume_number(clusters, ignore_zero=True) -> np.ndarray:
+    if ignore_zero: first_index = 1
+    else: first_index = 0
+    return np.array(range(first_index, int(np.nanmax(clusters))+1))
+
+
+def file_id(filename=None, mode="Sentinel-5P") -> str:
+
+    if mode == "Sentinel-5P":
+        # turn 
+        # S5P_OFFL_L2__NO2____20240601T002118_20240601T020248_34371_03_020600_20240606T165116.nc
+        # into
+        # S5P_NO2_240601_34371
+        # satellite_product_yymmdd_orbit
+        if filename is None:
+            return "unknown_file"
+        else:
+            base = os.path.basename(filename)
+            parts = base.split("_")
+            if len(parts) < 5:
+                raise ValueError(f"Filename {filename} does not match expected format for Sentinel-5p.")
+            satellite = parts[0]
+            product = parts[4]
+            date = parts[8][2:8]  # yymmdd
+            orbit = parts[10]
+            return f"{satellite}_{product}_{date}_{orbit}"
+    else:
+        raise ValueError(f"Unknown file_id mode: {mode}")      
+    
+
+
+def clusters_file_name(clusters, file_id, ignore_zero=True) -> np.ndarray:
+    n_clusters = int(np.nanmax(clusters))+1
+    if ignore_zero:
+        n_clusters -= 1
+    return np.array([file_id]*n_clusters)
+
+
+def clusters_n_points_in_file(clusters, return_full_array=True, ignore_zero=True) -> np.ndarray:
+    if return_full_array:
+        n_points_in_file = np.zeros(int(np.nanmax(clusters))+1, dtype=int) + len(clusters.flatten())
+        
+        if ignore_zero:
+            return n_points_in_file[1:]
+        else:
+            return n_points_in_file
+    
+    else:
+        return len(clusters.flatten())
+
+
+def clusters_max_point_index(clusters, values, ignore_zero=True):
+
+    labels = np.asarray(clusters).ravel()
+    vals = np.asarray(values).ravel()
+
+    valid = np.isfinite(labels) & np.isfinite(vals)
+    labels = labels[valid].astype(np.int64, copy=False)
+    vals = vals[valid]
+    flat_idx = np.nonzero(valid)[0] # indexes of valid points in flattened array
+
+    if ignore_zero:
+        nz = labels > 0
+        labels = labels[nz]
+        vals = vals[nz]
+        flat_idx = flat_idx[nz]
+
+    n_labels = int(np.nanmax(clusters)) + 1
+
+    # Keep same shape idea: one [row, col] per cluster
+    out = np.full((n_labels, 2), -1, dtype=np.int64)
+
+    if labels.size == 0:
+        return out[1:] if ignore_zero else out
+
+    # Groupwise max via sorting: label asc, value desc
+    order = np.lexsort((-vals, labels)) # sort first by label acending, then by value decending. Highest value per label will be first in each group of labels.
+    labels_s = labels[order]
+    idx_s = flat_idx[order]
+
+    first = np.empty(labels_s.size, dtype=bool)
+    first[0] = True
+    first[1:] = labels_s[1:] != labels_s[:-1] # find where labels change
+
+    best_labels = labels_s[first]
+    best_flat = idx_s[first]
+
+    # Convert flat indices back to (row, col)
+    rr, cc = np.unravel_index(best_flat, np.asarray(clusters).shape)
+    out[best_labels, 0] = rr
+    out[best_labels, 1] = cc
+
+    return out[1:] if ignore_zero else out
+
+
+def clusters_max_point_locs_from_index(lon, lat, max_point_indices=None, clusters=None, values=None, ignore_zero=None):
+    if max_point_indices is None:
+        max_point_indices = clusters_max_point_index(clusters, values, ignore_zero)
+    return np.transpose((lon[max_point_indices[:, 0], max_point_indices[:, 1]], lat[max_point_indices[:, 0], max_point_indices[:, 1]]))
+
+
+def clusters_max_point_values_from_index(values, max_point_indices=None, clusters=None, ignore_zero=None):
+    if max_point_indices is None:
+        max_point_indices = clusters_max_point_index(clusters, values, ignore_zero)
+    return values[max_point_indices[:, 0], max_point_indices[:, 1]]
+
+
+def clusters_timestamp_utc_from_index(timestamps, max_point_indices=None, clusters=None, values=None, ignore_zero=None):
+    """ 
+    Expects timestamps to be a 1D array of length equal to the number of rows in clusters (= n scanlines).
+
+    """
+
+    if max_point_indices is None:
+        max_point_indices = clusters_max_point_index(clusters, values, timestamps, ignore_zero)
+    return timestamps[max_point_indices[:, 0]]    
+
+
+
+def clusters_n_points(clusters, ignore_zero=True) -> np.ndarray:
+    """Count points per cluster label."""
+    c = np.asarray(clusters, dtype=float)
+    n_labels = int(np.nanmax(c)) + 1
+    
+    # Keep only valid cluster labels
+    valid = np.isfinite(c)
+    labels = c[valid].astype(np.int64, copy=False)
+    
+    # bincount is O(n) and vectorized
+    counts = np.bincount(labels, minlength=n_labels)
+    
+    return counts[1:] if ignore_zero else counts
+
+
+def clusters_mean_point_values(clusters, values, ignore_zero=True):
+    """Mean value per cluster label."""
+    c = np.asarray(clusters, dtype=float)
+    v = np.asarray(values, dtype=float)
+    
+    if c.shape != v.shape:
+        raise ValueError("clusters and values must have the same shape")
+    
+    n_labels = int(np.nanmax(c)) + 1
+    
+    # Keep only valid labels and values
+    valid = np.isfinite(c) & np.isfinite(v)
+    labels = c[valid].astype(np.int64, copy=False)
+    vals = v[valid]
+    
+    # Sum and counts per label via bincount
+    sums = np.bincount(labels, weights=vals, minlength=n_labels)
+    counts = np.bincount(labels, minlength=n_labels)
+    
+    # Safe division sums/counts, avoiding division by zero
+    means = np.full(n_labels, np.nan, dtype=float)
+    nonzero = counts > 0
+    means[nonzero] = sums[nonzero] / counts[nonzero]
+    
+    return means[1:] if ignore_zero else means
+
+def clusters_median_point_values(clusters, values, ignore_zero=True):
+    """
+    Median value per cluster label.
+    sort labels once, then process grouped slices.
+    """
+    c = np.asarray(clusters, dtype=float)
+    v = np.asarray(values, dtype=float)
+
+    if c.shape != v.shape:
+        raise ValueError("clusters and values must have the same shape")
+
+    n_labels = int(np.nanmax(c)) + 1
+    out = np.full(n_labels, np.nan, dtype=float)
+
+    # Keep only finite label-value pairs (equivalent to nanmedian behavior per cluster)
+    valid = np.isfinite(c) & np.isfinite(v)
+    if not np.any(valid):
+        return out[1:] if ignore_zero else out
+
+    labels = c[valid].astype(np.int64, copy=False).ravel()
+    vals = v[valid].ravel()
+
+    # Group by label via one stable sort
+    order = np.argsort(labels, kind="mergesort")
+    labels_s = labels[order]
+    vals_s = vals[order]
+
+    uniq, starts, counts = np.unique(labels_s, return_index=True, return_counts=True)
+
+    # Median per contiguous group
+    for lab, s, cnt in zip(uniq, starts, counts):
+        out[lab] = np.median(vals_s[s:s + cnt])
+
+    return out[1:] if ignore_zero else out
+
+def clusters_bounding_boxes(clusters, lon, lat, ignore_zero=True):
+    """
+    Returns bounding boxes as:
+    [min_lon, min_lat, max_lon, max_lat] per cluster label.
+    """
+    c = np.asarray(clusters, dtype=float)
+    x = np.asarray(lon, dtype=float)
+    y = np.asarray(lat, dtype=float)
+
+    if c.shape != x.shape or c.shape != y.shape:
+        raise ValueError("clusters, lon, and lat must have the same shape")
+
+    n_labels = int(np.nanmax(c)) + 1
+
+    # Initialize outputs
+    min_lon = np.full(n_labels, np.inf, dtype=float) 
+    min_lat = np.full(n_labels, np.inf, dtype=float)
+    max_lon = np.full(n_labels, -np.inf, dtype=float)
+    max_lat = np.full(n_labels, -np.inf, dtype=float)
+
+    # Keep only finite triplets
+    valid = np.isfinite(c) & np.isfinite(x) & np.isfinite(y)
+    labels = c[valid].astype(np.int64, copy=False)
+    xv = x[valid]
+    yv = y[valid]
+
+    # Optional: skip label 0 directly
+    if ignore_zero:
+        keep = labels > 0
+        labels = labels[keep]
+        xv = xv[keep]
+        yv = yv[keep]
+
+    # One-pass grouped min/max
+    np.minimum.at(min_lon, labels, xv) # index=labels, values=xv
+    np.minimum.at(min_lat, labels, yv) 
+    np.maximum.at(max_lon, labels, xv)
+    np.maximum.at(max_lat, labels, yv)
+
+    bboxes = np.column_stack((min_lon, min_lat, max_lon, max_lat))
+
+    # Labels not present remain inf/-inf, convert to NaN
+    missing = ~np.isfinite(min_lon) | ~np.isfinite(min_lat) | ~np.isfinite(max_lon) | ~np.isfinite(max_lat)
+    bboxes[missing] = np.nan
+
+    return bboxes[1:] if ignore_zero else bboxes
+
+
+def calc_pixel_areas_km2(lon_bounds, lat_bounds, geod=Geod(ellps="WGS84")):
+    """
+    lon_bounds, lat_bounds: shape (n_pixels, 4)
+    returns: area_km2, shape (n_pixels,)
+    """
+    shape = lon_bounds.shape[:-1]
+    lon_bounds = lon_bounds.reshape(-1, 4)
+    lat_bounds = lat_bounds.reshape(-1, 4)
+    n = lon_bounds.shape[0]
+    areas = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        area, _ = geod.polygon_area_perimeter(
+            lon_bounds[i], lat_bounds[i]
+        )
+        areas[i] = abs(area) * 1e-6  # m² → km²
+
+    return areas.reshape(shape)
+def cluster_areas_from_pixel_areas(
+    clusters, lon_bounds, lat_bounds, ignore_zero=True
+):
+    """
+    clusters: shape (n_pixels,), integer labels
+    pixel_areas_km2: shape (n_pixels,)
+    """
+
+    # Flatten
+    clusters = clusters.reshape(-1)
+    lon_bounds = lon_bounds.reshape(-1, 4)
+    lat_bounds = lat_bounds.reshape(-1, 4)
+
+    #
+
+    geod = Geod(ellps="WGS84")
+
+    if ignore_zero:
+        clusters = clusters.astype(np.int64)
+        valid = np.isfinite(clusters) & (clusters > 0)
+        lon_bounds = lon_bounds[valid]
+        lat_bounds = lat_bounds[valid]
+        clusters = clusters[valid]
+        mask = np.isfinite(clusters)
+    else:
+        mask = np.isfinite(clusters)
+        lon_bounds = lon_bounds[mask]
+        lat_bounds = lat_bounds[mask]
+        clusters = clusters[mask].astype(np.int64)
+
+    pixel_areas_km2 = calc_pixel_areas_km2(lon_bounds, lat_bounds, geod=geod)
+
+    areas = np.bincount(
+        clusters.astype(np.int64).flatten(),
+        weights=pixel_areas_km2.flatten()
+    )
+
+    if ignore_zero:
+        areas = areas[1:]
+
+    return areas
+
+def cluster_areas_fast_approximate_sentinel5():
+    # TODO implement a fast approximation of cluster areas for Sentinel-5P data, based on the known pixel size at the equator and the latitude of the cluster (since pixel size varies with latitude).
+    raise NotImplementedError("cluster_areas_fast_approximate_sentinel5 not implemented yet")
+
+
+def clusters_is_weekend(time, clusters=None, return_full_array=True, ignore_zero=True):
+    """Whether each timestamp falls on a weekend (Sat/Sun)."""
+    time_array = pd.to_datetime(time).tz_localize(None).values
+    ts_days = np.asarray(time_array, dtype="datetime64[D]")
+
+    result = ~np.is_busday(ts_days)[0]  # True for Sat/Sun
+
+    if return_full_array:
+        if ignore_zero:
+            return np.zeros(int(np.nanmax(clusters)),dtype=bool) + result
+        else:
+            return np.zeros(int(np.nanmax(clusters))+1,dtype=bool) + result
+    else:
+        return result[0]
+    
+def clusters_day_of_week(time, clusters=None, return_full_array=True, ignore_zero=True):
+    """
+    Day of week from timestamps, Monday=0 ... Sunday=6.
+
+    If return_full_array=True this returns an array of length
+    `int(np.nanmax(clusters)) + 1`. If `ignore_zero=True` the returned
+    array slices off index 0 so its length is `n_labels - 1`.
+    """
+    time_array = pd.to_datetime(time).tz_localize(None).values
+    ts_days = np.asarray(time_array, dtype="datetime64[D]")
+
+    # Monday=0 ... Sunday=6
+    dow = (ts_days.astype("int64") + 3)[0] % 7
+
+    if return_full_array:
+        if clusters is None:
+            raise ValueError("clusters must be provided when return_full_array=True")
+        n = int(np.nanmax(clusters)) + 1
+
+        if dow.ndim == 0:
+            arr = np.full(n, int(dow), dtype=np.int8)
+        elif dow.size == 1:
+            arr = np.full(n, int(dow.ravel()[0]), dtype=np.int8)
+        else:
+            arr = dow.astype(np.int8, copy=False)
+
+        return arr[1:] if ignore_zero else arr
+
+    if dow.ndim == 0:
+        return int(dow)
+    return dow[0].astype(np.int8, copy=False)
+
+
+def clusters_is_land(max_point_locs, map_data=None):
+    """Vectorized spatial join for checking if points are on land."""
+    if map_data is None:
+        map_data = gpd.read_file(
+            "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip"
+        )
+        map_data = map_data.to_crs(epsg=4326)
+
+    # Create GeoDataFrame from points
+    points_gdf = gpd.GeoDataFrame(
+        geometry=[Point(lon, lat) for lon, lat in max_point_locs],
+        crs="EPSG:4326"
+    )
+    
+    # Spatial join: points that intersect with map polygons are on land
+    result = gpd.sjoin(points_gdf, map_data, how='left', predicate='intersects')
+    is_land_array = result['index_right'].notna().values
+    
+    return is_land_array
+
+
+
+
+def build_latlon_kdtree(lon_grid, lat_grid, values):
+    lons = lon_grid.ravel()
+    lats = lat_grid.ravel()
+    vals = values.ravel()
+
+    valid = ~np.isnan(vals)
+    lons = lons[valid]
+    lats = lats[valid]
+    vals = vals[valid]
+
+    # Scale longitude by cos(latitude)
+    x = lons * np.cos(np.deg2rad(lats))
+    y = lats
+
+    tree = KDTree(np.column_stack((x, y)))
+
+    return tree, lons, lats, vals
+
+
+def clusters_median_of_neighbourhood_kdtree_exact(
+    tree,
+    lons,
+    lats,
+    vals,
+    max_point_locs,
+    radius_km
+):
+    medians = np.full(len(max_point_locs), np.nan)
+
+    radius_deg = radius_km / 111.32  # rough upper bound
+
+    for i, (lon_c, lat_c) in enumerate(max_point_locs):
+        xc = lon_c * np.cos(np.deg2rad(lat_c))
+        yc = lat_c
+
+        idx = tree.query_ball_point([xc, yc], radius_deg)
+        if not idx:
+            continue
+
+        candidates = np.column_stack((lats[idx], lons[idx]))
+        center = np.column_stack((
+            np.full(len(idx), lat_c),
+            np.full(len(idx), lon_c),
+        ))
+
+        dists = haversine_vector(candidates, center, Unit.KILOMETERS)
+
+        neighbors = vals[idx][dists <= radius_km]
+        if neighbors.size > 0:
+            medians[i] = np.nanmedian(neighbors)
+
+    return medians
+
+
+def clusters_is_max_point_on_edge(clusters, max_point_indices, ignore_zero=True):
+    is_on_edge = np.zeros(len(max_point_indices), dtype=bool)
+
+    for i, (row_idx, col_idx) in enumerate(max_point_indices):
+        cluster_id = i + 1 if ignore_zero else i
+        neighbors = clusters[max(0, row_idx-1):row_idx+2, max(0, col_idx-1):col_idx+2].flatten()
+        is_on_edge[i] = np.any((neighbors != cluster_id) & ~np.isnan(neighbors))
+
+    return is_on_edge
+
+
+
+def clusters_is_plume_connected_to_nans_or_edge(
+    clusters,
+    ignore_zero=True,
+    connectivity=8,   # 4 or 8
+):
+    c = np.asarray(clusters, dtype=float)
+    n_clusters = int(np.nanmax(c)) + 1
+    out = np.zeros(n_clusters, dtype=bool)
+
+    # Pad with NaN so touching the image boundary counts as touching edge
+    p = np.pad(c, 1, mode="constant", constant_values=np.nan)
+    center = p[1:-1, 1:-1]
+
+    if connectivity == 4:
+        # N, S, W, E
+        touch_nan = (
+            np.isnan(p[:-2, 1:-1]) |   # north
+            np.isnan(p[2:, 1:-1])  |   # south
+            np.isnan(p[1:-1, :-2]) |   # west
+            np.isnan(p[1:-1, 2:])       # east
+        )
+    elif connectivity == 8:
+        # N, S, W, E + diagonals
+        touch_nan = (
+            np.isnan(p[:-2, :-2]) | np.isnan(p[:-2, 1:-1]) | np.isnan(p[:-2, 2:]) |
+            np.isnan(p[1:-1, :-2])                           | np.isnan(p[1:-1, 2:]) |
+            np.isnan(p[2:, :-2])  | np.isnan(p[2:, 1:-1])  | np.isnan(p[2:, 2:])
+        )
+    else:
+        raise ValueError("connectivity must be 4 or 8")
+
+    valid = np.isfinite(center)
+    if ignore_zero:
+        valid &= (center > 0)
+
+    touched_labels = center[valid & touch_nan].astype(np.int64)
+    if touched_labels.size:
+        # Slightly faster than unique for this use case
+        hit = np.bincount(touched_labels, minlength=n_clusters) > 0
+        out |= hit
+
+    return out[1:] if ignore_zero else out
+
+
+
+def clusters_connected_plumes(clusters, ignore_zero=True, connectivity=8):
+    """
+    For each cluster, return a set of adjacent cluster IDs.
+    connectivity: 4 or 8
+
+    Behavior with ignore_zero:
+    - ignore_zero=False: returns sets for clusters 0..N
+    - ignore_zero=True: returns sets for clusters 1..N
+      but 0 is still included inside those sets if adjacent
+    """
+    c = np.asarray(clusters, dtype=float)
+    n_all = int(np.nanmax(c)) + 1
+
+    # Output layout
+    n_out = n_all - 1 if ignore_zero else n_all
+    connected = [set() for _ in range(n_out)]
+
+    def collect_pairs(a, b):
+        # Finite neighboring labels that differ
+        valid = np.isfinite(a) & np.isfinite(b) & (a != b)
+
+        if not np.any(valid):
+            return np.empty((0, 2), dtype=np.int64)
+
+        p = np.stack(
+            [a[valid].astype(np.int64), b[valid].astype(np.int64)],
+            axis=1
+        )
+
+        # Undirected edge: (i, j) == (j, i)
+        p.sort(axis=1)
+
+        # Remove duplicates
+        return np.unique(p, axis=0)
+
+    # 4-neighborhood: horizontal + vertical
+    pair_blocks = [
+        collect_pairs(c[:, :-1], c[:, 1:]),   # left-right
+        collect_pairs(c[:-1, :], c[1:, :])    # up-down
+    ]
+
+    # 8-neighborhood adds diagonals
+    if connectivity == 8:
+        pair_blocks.append(collect_pairs(c[:-1, :-1], c[1:, 1:]))  # down-right
+        pair_blocks.append(collect_pairs(c[:-1, 1:], c[1:, :-1]))  # down-left
+    elif connectivity != 4:
+        raise ValueError("connectivity must be 4 or 8")
+
+    pairs = np.concatenate(pair_blocks, axis=0)
+    if pairs.size == 0:
+        return connected
+
+    pairs = np.unique(pairs, axis=0)
+
+    def idx_in_output(label):
+        if ignore_zero:
+            if label == 0:
+                return None
+            return label - 1
+        return label
+
+    # Build symmetric adjacency sets
+    for a, b in pairs:
+        ia = idx_in_output(a)
+        ib = idx_in_output(b)
+
+        # Add b into a's set if a has an output slot
+        if ia is not None:
+            connected[ia].add(int(b))
+
+        # Add a into b's set if b has an output slot
+        if ib is not None:
+            connected[ib].add(int(a))
+
+    return connected
+
+
+def clusters_mean_q_value(clusters, qa_values, ignore_zero=True):
+    """
+    Mean qa_value per cluster label.
+
+    Parameters
+    ----------
+    clusters : array-like
+        Cluster label grid (can contain NaN). Expected integer-like labels: 0,1,2,...
+    qa_values : array-like
+        qa_value grid, same shape as clusters.
+    ignore_zero : bool
+        If True, exclude cluster 0 from returned array.
+
+    Returns
+    -------
+    np.ndarray
+        Mean qa_value per cluster.
+        - If ignore_zero=False: index i corresponds to cluster i.
+        - If ignore_zero=True: result[0] corresponds to cluster 1.
+        Clusters with no valid qa pixels are returned as NaN.
+    """
+    c = np.asarray(clusters, dtype=float)
+    q = np.asarray(qa_values, dtype=float)
+
+    if c.shape != q.shape:
+        raise ValueError("clusters and qa_values must have the same shape")
+
+    # Keep only finite labels and finite qa values
+    valid = np.isfinite(c) & np.isfinite(q)
+    if not np.any(valid):
+        return np.array([], dtype=float)
+
+    labels = c[valid].astype(np.int64, copy=False)
+    qa = q[valid]
+
+    n_labels = int(np.nanmax(c)) + 1
+
+    # Sum and counts per label
+    sums = np.bincount(labels, weights=qa, minlength=n_labels)
+    counts = np.bincount(labels, minlength=n_labels)
+
+    means = np.full(n_labels, np.nan, dtype=float)
+    nonzero = counts > 0
+    means[nonzero] = sums[nonzero] / counts[nonzero]
+
+    return means[1:] if ignore_zero else means
+
+
+# Wrapper for cluster analysis methods
+def analyze_clusters(method, clusters, lon=None, lat=None, values=None, timestamps=None, qa_values=None, variable_names=None, max_point_indices=None, ignore_zero=True, verbose=False, filename=None, **kwargs):
+    """ """
+
+    if method == "plume_id":
+        return clusters_plume_id(clusters, file_id=file_id(filename=filename), ignore_zero=ignore_zero)
+    elif method == "plume_number":
+        return clusters_plume_number(clusters, ignore_zero=ignore_zero)
+    elif method == "file_name":
+        return clusters_file_name(clusters, file_id=file_id(filename=filename), ignore_zero=ignore_zero)
+    elif method == "n_points_in_file":
+        return clusters_n_points_in_file(clusters, return_full_array=False, ignore_zero=ignore_zero)
+    elif method == "max_point_indices":
+        return clusters_max_point_index(clusters, values, ignore_zero=ignore_zero)
+    elif method == "max_point_locs":
+        return clusters_max_point_locs_from_index(lon, lat, max_point_indices=max_point_indices, clusters=clusters, values=values, ignore_zero=ignore_zero)
+    elif method == "max_point_value":
+        return clusters_max_point_values_from_index(values, max_point_indices=max_point_indices, clusters=clusters, ignore_zero=ignore_zero)
+    elif method == "timestamp_utc":
+        return clusters_timestamp_utc_from_index(timestamps, max_point_indices=max_point_indices, clusters=clusters, values=values, ignore_zero=ignore_zero)
+    elif method == "n_points":
+        return clusters_n_points(clusters, ignore_zero=ignore_zero)
+    elif method == "mean_point_value":
+        return clusters_mean_point_values(clusters, values, ignore_zero=ignore_zero)
+    elif method == "median_point_value":
+        return clusters_median_point_values(clusters, values, ignore_zero=ignore_zero)
+    elif method == "bounding_box":
+        return clusters_bounding_boxes(clusters, lon, lat, ignore_zero=ignore_zero)
+    elif method == "areas_from_pixel_areas":
+        raise NotImplementedError("areas_from_pixel_areas not implemented yet")
+    elif method == "is_weekend":
+        return clusters_is_weekend(timestamps, clusters=clusters, return_full_array=True, ignore_zero=ignore_zero)
+    elif method == "day_of_week":
+        return clusters_day_of_week(timestamps, clusters=clusters, return_full_array=True, ignore_zero=ignore_zero)
+    elif method == "is_on_land":
+        max_point_locs = clusters_max_point_locs_from_index(lon, lat, max_point_indices=max_point_indices, clusters=clusters, values=values, ignore_zero=ignore_zero)
+        return clusters_is_land(max_point_locs)
+    elif method == "median_of_neighbourhood":
+        tree, lons, lats, vals = build_latlon_kdtree(lon, lat, values)
+        max_point_locs = clusters_max_point_locs_from_index(lon, lat, max_point_indices=max_point_indices, clusters=clusters, values=values, ignore_zero=ignore_zero)
+        radius_km = kwargs.get("radius_km", 10)
+        return clusters_median_of_neighbourhood_kdtree_exact(tree, lons, lats, vals, max_point_locs, radius_km)
+    elif method == "is_max_point_on_edge":
+        return clusters_is_max_point_on_edge(clusters, max_point_indices, ignore_zero)
+    elif method == "is_plume_connected_to_nans_or_edge":
+        return clusters_is_plume_connected_to_nans_or_edge(clusters, ignore_zero, connectivity=kwargs.get("connectivity", 8))
+    elif method == "connected_plumes":
+        return clusters_connected_plumes(clusters, ignore_zero, connectivity=kwargs.get("connectivity", 8))
+    elif method == "mean_q_value":
+        return clusters_mean_q_value(clusters, qa_values, ignore_zero)
+    else:
+        raise ValueError(f"Unknown cluster analysis method: {method}")
+
+
+    
 
 # ==================================================================================================================================================================================================================================================
 
@@ -1184,7 +2249,20 @@ def scea_interactive(
     import ipywidgets as widgets
     import matplotlib.pyplot as plt
     from IPython.display import display
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
 
+    print(""" TODO
+Instructions:
+
+    PRE-PROSESSING:
+          
+    SCEA PARAMETERS:
+        growth_limit: Higher value -> smaller clusters. The number sets a threshold in terms of standard deviations from the median (or mean) of the local window. Points with values below the threshold will not enlargen the cluster.
+        detection_limit: Higher value -> less clusters. The number sets a threshold in terms of standard deviations from the median (or mean) for the initial seed points.
+        local_box_radius: Radius of the local window (in coordinate units) that are considered for each seed point when creating a cluster. Larger windows are computationally more expensive.
+        max_pts_start_radius: Approximately, larger value -> jumps bigger gaps. The number sets a threshold for the maximum numbe of clustered points that can be within the starting radius of a point. If there are more points than this threshold, the point will not enlargen the cluster.
+          """)
 
     compact_layout = Layout(width='130px')
     less_compact_layout = Layout(width='140px')
@@ -1320,10 +2398,7 @@ def scea_interactive(
         
         # Standardize
         if std_type_val == "median_mad":
-            if use_numba:
-                arr = np.asarray(local_standardization_m_mad_numba(base, window=int(window)))
-            else:
-                arr = np.asarray(local_standardization_m_mad(base, window=int(window)))
+            arr = np.asarray(local_standardization_m_mad(base, window=int(window), use_numba=use_numba))
         else:
             arr = np.asarray(local_standardization(base, window=int(window)))
 
