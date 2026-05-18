@@ -13,15 +13,45 @@ import logging
 from logging.handlers import RotatingFileHandler
 from tqdm import tqdm
 import time
+import gc
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize, BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch, Rectangle
+    from matplotlib.collections import PatchCollection
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    try:
+        import cmcrameri.cm as cmc
+    except Exception:
+        cmc = None
+    try:
+        import colorcet as cc
+    except Exception:
+        cc = None
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    plt = None
+    Normalize = None
+    Patch = None
+    ccrs = None
+    cfeature = None
+    cmc = None
+    cc = None
+    MATPLOTLIB_AVAILABLE = False
+else:
+    plt.ion()
+
 
 
 def default_config():
     return {        
         # File variables
         "io_variables": {
-            "files_dir": '/Users/eliaserv/Documents/Satellite data/sentinel5p-no2/2024/S5P_NO2_January_2024',
+            #"files_dir": '/Users/eliaserv/Documents/Satellite data/sentinel5p-no2/2024/S5P_NO2_January_2024',
+            "files_dir": '/Users/eliaserv/Documents/VSCode_projects/SCEA/SCEA_developements/example_data',
             "files_type": "nc",
-            "file_indices_to_extract": [0,1,2,3], # e.g. [0, 1, 2] to extract first three files, or None to extract all files
+            "file_indices_to_extract": [1,2,3], # e.g. [0, 1, 2] to extract first three files, or None to extract all files
             "open_file_kwargs": {"group": "PRODUCT", "mask_and_scale": True}, # e.g. {"chunks": {"time": 10}} to open files with dask and chunking, or {} for default xarray open_dataset behavior
             "wind_data_dir": '/Volumes/One Touch/ERA5/data.grib',
             "wind_data_type": "grib",
@@ -43,16 +73,16 @@ def default_config():
             {"name": "crop_to_bbox", "enabled": False, "kwargs": {"bbox": [-10.0, 35.0, 30.0, 70.0]}}, # [min_lon, min_lat, max_lon, max_lat]
             {"name": "quality_filter", "enabled": True, "kwargs": {"threshold": 0.75}},
             {"name": "discard_small_files", "enabled": True, "kwargs": {"min_valid_points": 10}},
-            {"name": "denoise_butterworth", "enabled": True, "kwargs": {"cutoff": 40, "order": 1}},
+            {"name": "denoise_butterworth", "enabled": False, "kwargs": {"cutoff": 40, "order": 1}}, # # TODO not working properly currently
             {"name": "nan_gaussian_filter", "enabled": True, "kwargs": {"sigma": 1}},
-            {"name": "local_standardization_m_mad", "enabled": True, "kwargs": {"window": 17}},
-            {"name": "denoise_butterworth", "enabled": True, "kwargs": {"cutoff": 40, "order": 2}},
+            {"name": "local_standardization_m_mad", "enabled": True, "kwargs": {"window": 27}},
+            {"name": "denoise_butterworth", "enabled": False, "kwargs": {"cutoff": 40, "order": 2}},
         ],
 
         # Detection: SCEA parameters
         "scea_parameters_algorithmic": {
             "growth_limit": 2,
-            "detection_limit": 3.0,
+            "detection_limit": 3.5,
             "max_pts_start_radius": 6,
             "local_box_size": 4,
             "metric": "geodesic",
@@ -96,7 +126,36 @@ def default_config():
         "verbose": False,
         "logger_console_output": False,
         "logger_console_level": "DEBUG", # INFO or DEBUG
-        "tqdm_enabled": True
+        "tqdm_enabled": True,
+        "step_by_step": False, # if True, will give plots and prompt user to press Enter before each major step (preprocessing, SCEA, analysis) for debugging and inspection
+        "step_by_step_plotting": {
+            "open_in_browser": True,
+            "max_background_points": 120000,
+            "max_cluster_overlay_points": 120000,
+            "max_cluster_markers": 4000,
+            "cluster_info_marker_pixels": 1.0,
+            "cluster_info_hover_pick_radius": 12,
+            "skip_preprocessing_steps": ["discard_small_files"],
+            "colorbar_tick_label_size": 4,
+            "extent_pole_exclusion_degrees": 20.0,
+            "render_mode": "pcolormesh_like",  # "points" or "pcolormesh_like"
+            "rect_marker_size": 80,
+            "map_background": True,
+            "map_style": "carto-positron",  # open-street-map, carto-positron, carto-darkmatter
+            "cartopy_resolution": "110m",
+            "show_land": True,
+            "show_ocean": True,
+            "show_coastlines": True,
+            "show_borders": False,
+            "color_upper_quantile": 0.999,  # e.g. 0.95 or 0.99; set None to disable
+            "color_lower_quantile": None,
+            "value_cmap": "batlow",
+            "cluster_cmap": "glasbey_light",
+            "cluster_colorbar_max_ticks": 10,
+            "figure_dpi": 150,
+            "figure_width_per_col": 14.0,
+            "figure_height": 9.5,
+        },
     }
 
 
@@ -110,6 +169,18 @@ SPLIT_COLUMNS = {
     "max_point_locs": ["max_lon", "max_lat"],
     "bounding_box": ["bbox_min_lon", "bbox_min_lat", "bbox_max_lon", "bbox_max_lat"],
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -409,6 +480,666 @@ def setup_logging(log_dir, run_id, level=logging.INFO, console_output=True):
 # PREPROSESSING
 # ============================
 
+def _format_kwargs_for_title(kwargs):
+    if not kwargs:
+        return "{}"
+    try:
+        return json.dumps(kwargs, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(kwargs)
+
+
+def _values_2d(da_or_array):
+    arr = np.ma.asarray(da_or_array)
+    if np.ma.isMaskedArray(arr):
+        arr = arr.filled(np.nan)
+    arr = np.asarray(arr)
+    if arr.ndim > 2:
+        arr = arr[0]
+    return np.asarray(arr)
+
+
+def _coerce_numeric_1d(arr):
+    out = pd.to_numeric(np.asarray(arr).reshape(-1), errors="coerce")
+    return np.asarray(out, dtype=float)
+
+
+def _downsample_flat(lon, lat, values, max_points):
+    n = len(lon)
+    if max_points is None or n <= max_points:
+        return lon, lat, values
+    rng = np.random.default_rng(0)
+    idx = rng.choice(n, size=max_points, replace=False)
+    return lon[idx], lat[idx], values[idx]
+
+
+def _normalize_quantile_param(value):
+    if value is None:
+        return None
+    q = float(value)
+    if q > 1.0:
+        q = q / 100.0
+    if q < 0.0:
+        q = 0.0
+    if q > 1.0:
+        q = 1.0
+    return q
+
+
+def _compute_color_limits(values, plotting_cfg):
+    arr = np.asarray(values).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None, None
+
+    q_low = _normalize_quantile_param(plotting_cfg.get("color_lower_quantile", None))
+    q_high = _normalize_quantile_param(plotting_cfg.get("color_upper_quantile", None))
+
+    cmin = np.nanmin(arr) if q_low is None else np.nanquantile(arr, q_low)
+    cmax = np.nanmax(arr) if q_high is None else np.nanquantile(arr, q_high)
+
+    if not np.isfinite(cmin) or not np.isfinite(cmax) or cmax <= cmin:
+        return None, None
+    return float(cmin), float(cmax)
+
+
+def _quality_filter_threshold(preprocessing_steps_cfg):
+    for step_cfg in preprocessing_steps_cfg or []:
+        if step_cfg.get("name") == "quality_filter" and step_cfg.get("enabled", False):
+            threshold = step_cfg.get("kwargs", {}).get("threshold", None)
+            if threshold is None:
+                return None
+            try:
+                return float(threshold)
+            except Exception:
+                return None
+    return None
+
+
+def _should_skip_preprocessing_step_plot(step_name, plotting_cfg):
+    skip_steps = plotting_cfg.get("skip_preprocessing_steps", []) or []
+    return step_name in set(skip_steps)
+
+
+def _continuous_value_cmap(plotting_cfg):
+    cmap_name = plotting_cfg.get("value_cmap", "batlow")
+    if cmap_name == "batlow" and cmc is not None:
+        return cmc.batlow
+    try:
+        return plt.get_cmap(cmap_name)
+    except Exception:
+        if cmc is not None:
+            return cmc.batlow
+        return plt.get_cmap("viridis")
+
+
+def _dataset_to_plot_arrays(data, variable_names_cfg, quality_threshold=None):
+    lon = np.ma.asarray(data[variable_names_cfg["lon"]])
+    lat = np.ma.asarray(data[variable_names_cfg["lat"]])
+    values = np.ma.asarray(data[variable_names_cfg["value"]])
+
+    if quality_threshold is not None and variable_names_cfg.get("quality") in data:
+        quality = np.ma.asarray(data[variable_names_cfg["quality"]])
+        quality = quality.filled(np.nan) if np.ma.isMaskedArray(quality) else np.asarray(quality)
+        values = np.ma.asarray(values, dtype=float)
+        values = np.where(np.asarray(quality, dtype=float) >= float(quality_threshold), values, np.nan)
+
+    if np.ma.isMaskedArray(lon):
+        lon = lon.filled(np.nan)
+    if np.ma.isMaskedArray(lat):
+        lat = lat.filled(np.nan)
+    if np.ma.isMaskedArray(values):
+        values = values.filled(np.nan)
+
+    lon = np.asarray(lon)
+    lat = np.asarray(lat)
+    values = _values_2d(values)
+    return lon, lat, values
+
+
+def _flatten_clusters_like_values(clusters):
+    return _coerce_numeric_1d(_values_2d(clusters))
+
+
+def _cluster_grid_for_plot(clusters):
+    cluster_grid = np.asarray(_values_2d(clusters), dtype=float)
+    # Explicitly match notebook behavior: cluster label 0 should not be plotted.
+    cluster_grid = np.where(cluster_grid == 0, np.nan, cluster_grid)
+    cluster_grid[~np.isfinite(cluster_grid)] = np.nan
+    cluster_grid[cluster_grid < 0] = np.nan
+    return cluster_grid
+
+
+def _categorical_cluster_cmap(max_cluster_id, plotting_cfg):
+    base_name = plotting_cfg.get("cluster_cmap", "glasbey_light")
+    max_cluster_id = int(max(1, max_cluster_id))
+
+    base = None
+    if base_name == "glasbey_light" and cc is not None:
+        base = cc.cm.glasbey_light
+    elif base_name == "glasbey" and cc is not None:
+        base = cc.cm.glasbey
+    else:
+        try:
+            base = plt.get_cmap(base_name, max_cluster_id)
+        except Exception:
+            base = plt.get_cmap("tab20", max_cluster_id)
+
+    if hasattr(base, "colors"):
+        colors = np.asarray(base.colors)
+        if colors.shape[0] < max_cluster_id:
+            reps = int(np.ceil(max_cluster_id / colors.shape[0]))
+            colors = np.tile(colors, (reps, 1))
+        colors = colors[:max_cluster_id]
+    else:
+        colors = base(np.linspace(0, 1, max_cluster_id))
+
+    cmap = ListedColormap(colors, name=f"{base_name}_{max_cluster_id}")
+    cmap.set_bad((0, 0, 0, 0))
+    boundaries = np.arange(0.5, max_cluster_id + 1.5, 1.0)
+    norm = BoundaryNorm(boundaries, cmap.N)
+    return cmap, norm
+
+
+def _data_extent(lon, lat, values=None, plotting_cfg=None):
+    lon = np.asarray(lon).reshape(-1)
+    lat = np.asarray(lat).reshape(-1)
+    finite = np.isfinite(lon) & np.isfinite(lat)
+    if values is not None:
+        values = np.asarray(values).reshape(-1)
+        finite = finite & np.isfinite(values)
+    lon = lon[finite]
+    lat = lat[finite]
+    if lon.size == 0 or lat.size == 0:
+        return (-180.0, 180.0, -90.0, 90.0)
+
+    pole_exclusion_degrees = 0.0
+    if plotting_cfg is not None:
+        pole_exclusion_degrees = float(plotting_cfg.get("extent_pole_exclusion_degrees", 0.0) or 0.0)
+        if pole_exclusion_degrees < 0.0:
+            pole_exclusion_degrees = 0.0
+        if pole_exclusion_degrees > 90.0:
+            pole_exclusion_degrees = 90.0
+
+    if pole_exclusion_degrees > 0:
+        lat_min_allowed = -90.0 + pole_exclusion_degrees
+        lat_max_allowed = 90.0 - pole_exclusion_degrees
+        core = (lat >= lat_min_allowed) & (lat <= lat_max_allowed)
+        if np.count_nonzero(core) >= 10:
+            lon_core = lon[core]
+            lat_core = lat[core]
+        else:
+            lon_core = lon
+            lat_core = lat
+    else:
+        lon_core = lon
+        lat_core = lat
+
+    lon_min, lon_max = float(np.min(lon_core)), float(np.max(lon_core))
+    lat_min, lat_max = float(np.min(lat_core)), float(np.max(lat_core))
+    lon_pad = max((lon_max - lon_min) * 0.03, 0.1)
+    lat_pad = max((lat_max - lat_min) * 0.03, 0.1)
+    return (lon_min - lon_pad, lon_max + lon_pad, lat_min - lat_pad, lat_max + lat_pad)
+
+
+def _setup_debug_axes(n_cols, plotting_cfg, extent):
+    use_cartopy = ccrs is not None and cfeature is not None and plotting_cfg.get("map_background", True)
+    subplot_kw = {"projection": ccrs.PlateCarree()} if use_cartopy else {}
+    fig_width = plotting_cfg.get("figure_width_per_col", 8.0) * n_cols
+    fig_height = plotting_cfg.get("figure_height", 6.5)
+    fig, axes = plt.subplots(1, n_cols, figsize=(fig_width, fig_height), squeeze=False, subplot_kw=subplot_kw, constrained_layout=True)
+    axes = list(axes[0])
+    fig.set_dpi(plotting_cfg.get("figure_dpi", 100))
+
+    for ax in axes:
+        if use_cartopy:
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+            resolution = plotting_cfg.get("cartopy_resolution", "110m")
+            if plotting_cfg.get("show_land", True):
+                ax.add_feature(cfeature.LAND.with_scale(resolution), facecolor="#f3efe8", zorder=0)
+            if plotting_cfg.get("show_ocean", True):
+                ax.add_feature(cfeature.OCEAN.with_scale(resolution), facecolor="#dceefb", zorder=0)
+            if plotting_cfg.get("show_coastlines", True):
+                ax.coastlines(resolution=resolution, linewidth=0.45, color="#444444", zorder=1)
+            if plotting_cfg.get("show_borders", False):
+                ax.add_feature(cfeature.BORDERS.with_scale(resolution), linewidth=0.25, edgecolor="#666666", zorder=1)
+            gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.25, linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.xlabel_style = {"size": 8}
+            gl.ylabel_style = {"size": 8}
+        else:
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.grid(True, alpha=0.25, linestyle="--")
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+
+    return fig, axes, use_cartopy
+
+
+def _pcolormesh_panel(ax, lon, lat, values, plotting_cfg, title, show_colorbar=False, cmap="batlow", alpha=1.0, use_cartopy=False, norm=None):
+    values = np.ma.asarray(values, dtype=float)
+    values = np.ma.masked_invalid(values)
+    if norm is None:
+        cmin, cmax = _compute_color_limits(values, plotting_cfg)
+        norm = Normalize(vmin=cmin, vmax=cmax) if (Normalize is not None and cmin is not None and cmax is not None) else None
+    kwargs = dict(cmap=cmap, shading="auto", alpha=alpha, norm=norm, edgecolors="none", antialiased=False, rasterized=True)
+    if use_cartopy:
+        kwargs["transform"] = ccrs.PlateCarree()
+    m = ax.pcolormesh(lon, lat, values, **kwargs)
+    ax.set_title(title)
+    if show_colorbar:
+        return m
+    return m
+
+
+def _add_colorbar(fig, mappable, ax, plotting_cfg, **kwargs):
+    cbar = fig.colorbar(mappable, ax=ax, **kwargs)
+    label_size = plotting_cfg.get("colorbar_tick_label_size", 5)
+    cbar.ax.tick_params(labelsize=label_size)
+    return cbar
+
+
+def _add_cluster_scatter(ax, lon, lat, color_values, use_cartopy=False, cmap="turbo", title=None):
+    scatter_kwargs = dict(c=color_values, cmap=cmap, s=16, edgecolors="black", linewidths=0.2)
+    if use_cartopy:
+        scatter_kwargs["transform"] = ccrs.PlateCarree()
+    sc = ax.scatter(lon, lat, **scatter_kwargs)
+    if title:
+        ax.set_title(title)
+    return sc
+
+
+def _save_and_show_figure(fig, out_path, logger=None):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    save_dpi = 120
+    try:
+        save_dpi = fig.get_dpi()
+    except Exception:
+        pass
+    fig.savefig(out_path, dpi=save_dpi, bbox_inches="tight")
+    if logger is not None:
+        logger.info(f"Saved debug plot: {out_path}")
+    try:
+        fig.canvas.manager.set_window_title(os.path.basename(out_path))
+    except Exception:
+        pass
+    plt.show(block=False)
+    try:
+        fig.canvas.draw_idle()
+        plt.pause(0.05)
+    except Exception:
+        pass
+
+
+def _pause_for_step(message, fig=None):
+    try:
+        input(message)
+    except EOFError:
+        pass
+    if fig is not None:
+        plt.close(fig)
+    plt.close("all")
+    gc.collect()
+
+
+def plot_preprocessing_step_debug(
+    original_data,
+    before_data,
+    after_data,
+    variable_names_cfg,
+    original_quality_threshold,
+    step_name,
+    step_kwargs,
+    debug_dir,
+    run_id,
+    file_id,
+    step_index,
+    plotting_cfg,
+    logger=None,
+):
+    if plt is None:
+        if logger is not None:
+            logger.warning("Matplotlib is unavailable. Skipping debug plot.")
+        return
+
+    original_lon, original_lat, original_val = _dataset_to_plot_arrays(original_data, variable_names_cfg, quality_threshold=original_quality_threshold)
+    before_lon, before_lat, before_val = _dataset_to_plot_arrays(before_data, variable_names_cfg)
+    after_lon, after_lat, after_val = _dataset_to_plot_arrays(after_data, variable_names_cfg)
+
+    panels = [
+        ("original", original_lon, original_lat, original_val),
+        ("before", before_lon, before_lat, before_val),
+        ("after", after_lon, after_lat, after_val),
+    ]
+
+    extent = _data_extent(
+        np.concatenate([_coerce_numeric_1d(p[1]) for p in panels]),
+        np.concatenate([_coerce_numeric_1d(p[2]) for p in panels]),
+        np.concatenate([_coerce_numeric_1d(p[3]) for p in panels]),
+        plotting_cfg,
+    )
+    fig, axes, use_cartopy = _setup_debug_axes(len(panels), plotting_cfg, extent)
+
+    kwargs_text = _format_kwargs_for_title(step_kwargs)
+    fig.suptitle(
+        f"run={run_id} | file={file_id} | preprocessing step {step_index + 1}: {step_name}\nkwargs={kwargs_text}",
+        fontsize=11,
+    )
+
+    for ax, (title, lon, lat, values) in zip(axes, panels, strict=False):
+        m = _pcolormesh_panel(ax, lon, lat, values.data, plotting_cfg, title, show_colorbar=False, cmap=_continuous_value_cmap(plotting_cfg), alpha=1.0, use_cartopy=use_cartopy)
+        _add_colorbar(fig, m, ax, plotting_cfg, shrink=0.34, pad=0.02, fraction=0.02)
+
+    out_path = os.path.join(debug_dir, f"{run_id}_{file_id}_preprocess_{step_index + 1:02d}_{step_name}.png")
+    _save_and_show_figure(fig, out_path, logger=logger)
+    _pause_for_step(f"[step-by-step] Inspect preprocessing step '{step_name}'. Press Enter to continue...", fig=fig)
+
+
+def plot_clustering_debug(
+    original_data,
+    preprocessed_data,
+    clusters,
+    variable_names_cfg,
+    original_quality_threshold,
+    debug_dir,
+    run_id,
+    file_id,
+    plotting_cfg,
+    logger=None,
+):
+    if plt is None:
+        if logger is not None:
+            logger.warning("Matplotlib is unavailable. Skipping debug plot.")
+        return
+
+    max_cluster_points = plotting_cfg.get("max_cluster_overlay_points", 120000)
+
+    o_lon, o_lat, o_val = _dataset_to_plot_arrays(original_data, variable_names_cfg, quality_threshold=original_quality_threshold)
+    p_lon, p_lat, p_val = _dataset_to_plot_arrays(preprocessed_data, variable_names_cfg)
+    p_lon_flat = _coerce_numeric_1d(p_lon)
+    p_lat_flat = _coerce_numeric_1d(p_lat)
+    p_val_flat = _coerce_numeric_1d(p_val)
+
+    cluster_grid = _cluster_grid_for_plot(clusters)
+
+    grid_rows = min(np.asarray(o_val).shape[0], np.asarray(p_val).shape[0], cluster_grid.shape[0])
+    grid_cols = min(np.asarray(o_val).shape[1], np.asarray(p_val).shape[1], cluster_grid.shape[1])
+    o_lon = np.asarray(o_lon)[:grid_rows, :grid_cols]
+    o_lat = np.asarray(o_lat)[:grid_rows, :grid_cols]
+    o_val = np.asarray(o_val)[:grid_rows, :grid_cols]
+    p_lon = np.asarray(p_lon)[:grid_rows, :grid_cols]
+    p_lat = np.asarray(p_lat)[:grid_rows, :grid_cols]
+    p_val = np.asarray(p_val)[:grid_rows, :grid_cols]
+    cluster_grid = np.asarray(cluster_grid)[:grid_rows, :grid_cols]
+    cluster_ids = cluster_grid[np.isfinite(cluster_grid)]
+    max_cluster_id = int(np.nanmax(cluster_ids)) if cluster_ids.size else 0
+    cluster_cmap, cluster_norm = _categorical_cluster_cmap(max_cluster_id, plotting_cfg) if max_cluster_id > 0 else (None, None)
+
+    panels = [
+        ("original", o_lon, o_lat, o_val),
+        ("preprocessed", p_lon, p_lat, p_val),
+        ("preprocessed + clusters", p_lon, p_lat, p_val),
+    ]
+    extent = _data_extent(
+        np.concatenate([_coerce_numeric_1d(p[1]) for p in panels]),
+        np.concatenate([_coerce_numeric_1d(p[2]) for p in panels]),
+        np.concatenate([_coerce_numeric_1d(p[3]) for p in panels]),
+        plotting_cfg,
+    )
+    fig, axes, use_cartopy = _setup_debug_axes(3, plotting_cfg, extent)
+
+    fig.suptitle(f"run={run_id} | file={file_id} | clustering result", fontsize=11)
+    value_cmap = _continuous_value_cmap(plotting_cfg)
+    bg1 = _pcolormesh_panel(axes[0], o_lon, o_lat, o_val, plotting_cfg, "original", show_colorbar=False, cmap=value_cmap, alpha=1.0, use_cartopy=use_cartopy)
+    bg2 = _pcolormesh_panel(axes[1], p_lon, p_lat, p_val, plotting_cfg, "preprocessed", show_colorbar=False, cmap=value_cmap, alpha=1.0, use_cartopy=use_cartopy)
+    bg3 = _pcolormesh_panel(axes[2], p_lon, p_lat, p_val, plotting_cfg, "preprocessed + clusters", show_colorbar=False, cmap=value_cmap, alpha=0.9, use_cartopy=use_cartopy)
+    _add_colorbar(fig, bg1, axes[0], plotting_cfg, shrink=0.34, pad=0.02, fraction=0.02)
+    _add_colorbar(fig, bg2, axes[1], plotting_cfg, shrink=0.34, pad=0.02, fraction=0.02)
+    _add_colorbar(fig, bg3, axes[2], plotting_cfg, shrink=0.34, pad=0.02, fraction=0.02)
+    if max_cluster_id > 0:
+        cluster_mesh = _pcolormesh_panel(
+            axes[2],
+            p_lon,
+            p_lat,
+            cluster_grid,
+            plotting_cfg,
+            "preprocessed + clusters",
+            show_colorbar=False,
+            cmap=cluster_cmap,
+            alpha=0.92,
+            use_cartopy=use_cartopy,
+            norm=cluster_norm,
+        )
+        tick_count = max(2, int(plotting_cfg.get("cluster_colorbar_max_ticks", 10)))
+        tick_step = max(1, max_cluster_id // tick_count)
+        ticks = np.arange(1, max_cluster_id + 1, tick_step)
+    else:
+        axes[2].text(0.5, 0.5, "No clusters detected", transform=axes[2].transAxes, ha="center", va="center")
+
+    out_path = os.path.join(debug_dir, f"{run_id}_{file_id}_clustering.png")
+    _save_and_show_figure(fig, out_path, logger=logger)
+    _pause_for_step("[step-by-step] Inspect clustering map. Press Enter to continue...", fig=fig)
+
+
+def _build_cluster_hover_text(row):
+    parts = []
+    for col in row.index:
+        val = row[col]
+        if isinstance(val, float):
+            val_str = f"{val:.6g}"
+        else:
+            val_str = str(val)
+        parts.append(f"{col}: {val_str}")
+    return "\n".join(parts)
+
+
+def plot_cluster_outputs_debug(
+    preprocessed_data,
+    clusters,
+    cluster_results,
+    variable_names_cfg,
+    debug_dir,
+    run_id,
+    file_id,
+    plotting_cfg,
+    logger=None,
+):
+    if plt is None:
+        if logger is not None:
+            logger.warning("Matplotlib is unavailable. Skipping debug plot.")
+        return
+
+    max_cluster_markers = plotting_cfg.get("max_cluster_markers", 4000)
+
+    p_lon, p_lat, p_val = _dataset_to_plot_arrays(preprocessed_data, variable_names_cfg)
+    p_lon_flat = _coerce_numeric_1d(p_lon)
+    p_lat_flat = _coerce_numeric_1d(p_lat)
+    p_val_flat = _coerce_numeric_1d(p_val)
+
+    cluster_grid = _cluster_grid_for_plot(clusters)
+
+    grid_rows = min(np.asarray(p_val).shape[0], cluster_grid.shape[0])
+    grid_cols = min(np.asarray(p_val).shape[1], cluster_grid.shape[1])
+    p_lon = np.asarray(p_lon)[:grid_rows, :grid_cols]
+    p_lat = np.asarray(p_lat)[:grid_rows, :grid_cols]
+    p_val = np.asarray(p_val)[:grid_rows, :grid_cols]
+    cluster_grid = np.asarray(cluster_grid)[:grid_rows, :grid_cols]
+
+    cluster_ids = cluster_grid[np.isfinite(cluster_grid)]
+    max_cluster_id = int(np.nanmax(cluster_ids)) if cluster_ids.size else 0
+    cluster_cmap, cluster_norm = _categorical_cluster_cmap(max_cluster_id, plotting_cfg) if max_cluster_id > 0 else (None, None)
+
+    if cluster_results is None or cluster_results.empty:
+        if logger is not None:
+            logger.info("No cluster output rows to visualize in step-by-step output stage.")
+        return
+
+    if not {"max_lon", "max_lat"}.issubset(cluster_results.columns):
+        if logger is not None:
+            logger.warning("Cluster output map skipped: max_lon/max_lat columns are missing.")
+        return
+
+    marker_df = cluster_results.copy()
+    marker_df = marker_df[np.isfinite(marker_df["max_lon"]) & np.isfinite(marker_df["max_lat"])].copy()
+    if len(marker_df) > max_cluster_markers:
+        marker_df = marker_df.sample(n=max_cluster_markers, random_state=0)
+
+    marker_rows = marker_df.reset_index(drop=True)
+    marker_texts = marker_rows.apply(_build_cluster_hover_text, axis=1).to_list()
+
+    extent = _data_extent(p_lon_flat, p_lat_flat, p_val_flat, plotting_cfg)
+    fig, axes, use_cartopy = _setup_debug_axes(1, plotting_cfg, extent)
+    ax = axes[0]
+    fig.suptitle(
+        f"run={run_id} | file={file_id} | clustering + plume output metadata (click markers)",
+        fontsize=11,
+    )
+
+    value_cmap = _continuous_value_cmap(plotting_cfg)
+    bg = _pcolormesh_panel(ax, p_lon, p_lat, p_val, plotting_cfg, "preprocessed + clusters + plume info points", show_colorbar=False, cmap=value_cmap, alpha=0.9, use_cartopy=use_cartopy)
+    if max_cluster_id > 0:
+        cluster_mesh = _pcolormesh_panel(
+            ax,
+            p_lon,
+            p_lat,
+            cluster_grid,
+            plotting_cfg,
+            "preprocessed + clusters + plume info points",
+            show_colorbar=False,
+            cmap=cluster_cmap,
+            alpha=0.92,
+            use_cartopy=use_cartopy,
+            norm=cluster_norm,
+        )
+        tick_count = max(2, int(plotting_cfg.get("cluster_colorbar_max_ticks", 10)))
+        tick_step = max(1, max_cluster_id // tick_count)
+        ticks = np.arange(1, max_cluster_id + 1, tick_step)
+    else:
+        ax.text(0.5, 0.5, "No clusters detected", transform=ax.transAxes, ha="center", va="center")
+
+    marker_grid = np.ma.masked_all((grid_rows, grid_cols), dtype=float)
+    marker_texts_by_cell = {}
+    marker_lon_values = []
+    marker_lat_values = []
+
+    max_indx_row_col = {"max_indx_row", "max_indx_col"}.issubset(marker_rows.columns)
+    if max_indx_row_col:
+        marker_rows["max_indx_row"] = pd.to_numeric(marker_rows["max_indx_row"], errors="coerce")
+        marker_rows["max_indx_col"] = pd.to_numeric(marker_rows["max_indx_col"], errors="coerce")
+
+    for idx, r in marker_rows.iterrows():
+        row_idx = None
+        col_idx = None
+        if max_indx_row_col:
+            row_val = r["max_indx_row"]
+            col_val = r["max_indx_col"]
+            if np.isfinite(row_val) and np.isfinite(col_val):
+                row_idx = int(row_val)
+                col_idx = int(col_val)
+                if not (0 <= row_idx < grid_rows and 0 <= col_idx < grid_cols):
+                    row_idx = None
+                    col_idx = None
+
+        if row_idx is None or col_idx is None:
+            try:
+                cx = float(r["max_lon"])
+                cy = float(r["max_lat"])
+                dist2 = (np.asarray(p_lon, dtype=float) - cx) ** 2 + (np.asarray(p_lat, dtype=float) - cy) ** 2
+                flat_idx = int(np.nanargmin(dist2))
+                row_idx, col_idx = np.unravel_index(flat_idx, dist2.shape)
+            except Exception:
+                continue
+
+        marker_grid[row_idx, col_idx] = 1.0
+        marker_texts_by_cell[(row_idx, col_idx)] = marker_texts[idx]
+        marker_lon_values.append(float(p_lon[row_idx, col_idx]))
+        marker_lat_values.append(float(p_lat[row_idx, col_idx]))
+
+    marker_cmap = ListedColormap(["#101010"])
+    marker_cmap.set_bad((0, 0, 0, 0))
+    marker_norm = Normalize(vmin=0.5, vmax=1.5) if Normalize is not None else None
+    marker_mesh = _pcolormesh_panel(
+        ax,
+        p_lon,
+        p_lat,
+        marker_grid,
+        plotting_cfg,
+        "preprocessed + clusters + plume info points",
+        show_colorbar=False,
+        cmap=marker_cmap,
+        alpha=0.95,
+        use_cartopy=use_cartopy,
+        norm=marker_norm,
+    )
+
+    ann = ax.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(12, 12),
+        textcoords="offset points",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.92),
+        arrowprops=dict(arrowstyle="->", color="black", lw=0.8),
+    )
+    ann.set_visible(False)
+
+    def _on_click(event):
+        if event.inaxes != ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        if not marker_lon_values:
+            return
+
+        click_scale = float(plotting_cfg.get("cluster_info_click_hit_scale", 1.5) or 1.5)
+        try:
+            lon_diffs = np.abs(np.diff(np.asarray(p_lon, dtype=float), axis=1))
+            lon_res = float(np.nanmedian(lon_diffs)) if lon_diffs.size else 0.01
+        except Exception:
+            lon_res = 0.01
+        try:
+            lat_diffs = np.abs(np.diff(np.asarray(p_lat, dtype=float), axis=0))
+            lat_res = float(np.nanmedian(lat_diffs)) if lat_diffs.size else 0.01
+        except Exception:
+            lat_res = 0.01
+
+        lon_tol = max(lon_res * click_scale, 1e-12)
+        lat_tol = max(lat_res * click_scale, 1e-12)
+
+        marker_lon_arr = np.asarray(marker_lon_values, dtype=float)
+        marker_lat_arr = np.asarray(marker_lat_values, dtype=float)
+        norm_dx = (marker_lon_arr - float(event.xdata)) / lon_tol
+        norm_dy = (marker_lat_arr - float(event.ydata)) / lat_tol
+        dist2 = norm_dx**2 + norm_dy**2
+        idx = int(np.argmin(dist2))
+
+        if not np.isfinite(dist2[idx]) or dist2[idx] > 1.0:
+            if ann.get_visible():
+                ann.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+
+        row = marker_rows.iloc[idx]
+        cell_key = None
+        if max_indx_row_col and np.isfinite(row["max_indx_row"]) and np.isfinite(row["max_indx_col"]):
+            cell_key = (int(row["max_indx_row"]), int(row["max_indx_col"]))
+
+        if cell_key in marker_texts_by_cell:
+            ann.set_text(marker_texts_by_cell[cell_key])
+        else:
+            ann.set_text(marker_texts[idx])
+        ann.xy = (float(marker_lon_arr[idx]), float(marker_lat_arr[idx]))
+        ann.set_visible(True)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("button_press_event", _on_click)
+
+    out_path = os.path.join(debug_dir, f"{run_id}_{file_id}_cluster_outputs_click.png")
+    _save_and_show_figure(fig, out_path, logger=logger)
+    _pause_for_step("[step-by-step] Inspect output map. Click a max-point marker to see plume metadata, then press Enter to continue...", fig=fig)
+
 def normalize_singleton_leading_dim(data, variable_names_cfg, logger=None, verbose=True) -> xr.Dataset:
     if logger is None:
         logger = logging.getLogger("scea_plume_detection")
@@ -435,7 +1166,17 @@ def normalize_singleton_leading_dim(data, variable_names_cfg, logger=None, verbo
     )
 
 
-def preprocess_for_scea(data, preprocessing_steps_cfg, variable_names_cfg, logger=None, verbose=True, tqdm=None) -> xr.Dataset:
+def preprocess_for_scea(
+    data,
+    preprocessing_steps_cfg,
+    variable_names_cfg,
+    logger=None,
+    verbose=True,
+    tqdm=None,
+    step_by_step=False,
+    original_data=None,
+    on_step_complete=None,
+) -> xr.Dataset:
     """
     data: xarray dataset containing the data to preprocess
     """
@@ -448,14 +1189,25 @@ def preprocess_for_scea(data, preprocessing_steps_cfg, variable_names_cfg, logge
         tqdm.set_description(status)
 
     j=0
-    for step_cfg in preprocessing_steps_cfg:
+    for step_idx, step_cfg in enumerate(preprocessing_steps_cfg):
         if step_cfg["enabled"]:
 
             step_kwargs = step_cfg.get("kwargs", {}) # get kwargs for this step, or empty dict if not provided
 
             logger.debug(f"Preprocessing: {step_cfg['name']} with kwargs: {step_kwargs}")
 
+            data_before = data.copy(deep=True) if step_by_step else None
+
             data = SCEA.preprocess_data_xr(data, step_cfg["name"], step_kwargs, variable_names_cfg, verbose=verbose)
+
+            if step_by_step and on_step_complete is not None and data is not None:
+                on_step_complete(
+                    step_idx=step_idx,
+                    step_cfg=step_cfg,
+                    before_data=data_before,
+                    after_data=data,
+                    original_data=original_data,
+                )
 
             if tqdm is not None:
                 preprocessing_steps_print_list[j] = "✅" + preprocessing_steps_print_list[j][1:]
@@ -719,6 +1471,9 @@ if __name__ == "__main__":
     output_cfg = config.get("output_fields", [])
     verbose = config.get("verbose", True)
     tqdm_enabled = config.get("tqdm_enabled", True)
+    step_by_step = config.get("step_by_step", False)
+    step_plot_cfg = config.get("step_by_step_plotting", {})
+    original_quality_threshold = _quality_filter_threshold(preprocessing_steps_cfg)
 
     # Generate hashes for config and input to track provenance and ensure reproducibility
     config_hash = get_config_hash(config, length=5)
@@ -740,9 +1495,13 @@ if __name__ == "__main__":
     logger.info("="*80)
     logger.info(f"Config hash: {config_hash}")
     logger.info(f"Input hash: {input_hash}")
+    if step_by_step:
+        logger.info("Step-by-step mode is enabled.")
+        if not MATPLOTLIB_AVAILABLE:
+            logger.warning("Matplotlib/Cartopy is not installed. Interactive debug plots will be skipped.")
 
-    # Validate config
-    validate_config(config)
+    # Validate config # TODO
+    #validate_config(config)
 
     # import SCEA
     sys.path.append(os.path.dirname(io_cfg["scea_path"]))
@@ -796,7 +1555,8 @@ if __name__ == "__main__":
 
 
         if tqdm_enabled:
-            tqdm_preprocessing = tqdm(total=1, bar_format="{desc}", desc=f"  [0]{[step_cfg["name"][:12] for step_cfg in preprocessing_steps_cfg if step_cfg["enabled"]]}", leave=False, position=2)
+            preprocess_names = [step_cfg['name'][:12] for step_cfg in preprocessing_steps_cfg if step_cfg['enabled']]
+            tqdm_preprocessing = tqdm(total=1, bar_format="{desc}", desc=f"  [0]{preprocess_names}", leave=False, position=2)
         else:
             tqdm_preprocessing = None
 
@@ -807,7 +1567,8 @@ if __name__ == "__main__":
         if tqdm_initial:
             tqdm_initial.set_description("="*120)
         if tqdm_preprocessing:
-            tqdm_preprocessing.set_description(f"  [0]Preprocessing ({', '.join(["⏳" + step_cfg['name'][:11] for step_cfg in preprocessing_steps_cfg if step_cfg['enabled']])})")
+            preprocess_progress = ["⏳" + step_cfg['name'][:11] for step_cfg in preprocessing_steps_cfg if step_cfg['enabled']]
+            tqdm_preprocessing.set_description(f"  [0]Preprocessing ({', '.join(preprocess_progress)})")
         if tqdm_scea:
             tqdm_scea.set_description(f"  [0]SCEA")
         if tqdm_results:
@@ -827,10 +1588,44 @@ if __name__ == "__main__":
 
             # If shape [1, x, y], normalize to [x, y] for SCEA processing. If leading dim >1, fail fast to avoid silently dropping data.
             data = normalize_singleton_leading_dim(data_raw, variable_names_cfg, logger=logger, verbose=verbose)
+            original_data_for_debug = data.copy(deep=True)
+
+            debug_dir = os.path.join(io_cfg["output_dir"], "step_by_step_debug", run_id, file_id)
+
+            def _on_preprocess_step_complete(step_idx, step_cfg, before_data, after_data, original_data):
+                if _should_skip_preprocessing_step_plot(step_cfg["name"], step_plot_cfg):
+                    logger.debug(f"Skipping debug plot for preprocessing step '{step_cfg['name']}'.")
+                    return
+
+                plot_preprocessing_step_debug(
+                    original_data=original_data,
+                    before_data=before_data,
+                    after_data=after_data,
+                    variable_names_cfg=variable_names_cfg,
+                    original_quality_threshold=original_quality_threshold,
+                    step_name=step_cfg["name"],
+                    step_kwargs=step_cfg.get("kwargs", {}),
+                    debug_dir=debug_dir,
+                    run_id=run_id,
+                    file_id=file_id,
+                    step_index=step_idx,
+                    plotting_cfg=step_plot_cfg,
+                    logger=logger,
+                )
 
 
             # Preprocess file with provided preprocessing steps in config
-            data = preprocess_for_scea(data, preprocessing_steps_cfg, variable_names_cfg, logger=logger, verbose=verbose, tqdm=tqdm_preprocessing)
+            data = preprocess_for_scea(
+                data,
+                preprocessing_steps_cfg,
+                variable_names_cfg,
+                logger=logger,
+                verbose=verbose,
+                tqdm=tqdm_preprocessing,
+                step_by_step=step_by_step,
+                original_data=original_data_for_debug,
+                on_step_complete=_on_preprocess_step_complete if step_by_step else None,
+            )
             if tqdm_preprocessing:
                 tqdm_preprocessing.refresh()
 
@@ -877,6 +1672,20 @@ if __name__ == "__main__":
             if tqdm_scea:
                 tqdm_scea.refresh()
 
+            if step_by_step:
+                plot_clustering_debug(
+                    original_data=original_data_for_debug,
+                    preprocessed_data=data,
+                    clusters=clusters,
+                    variable_names_cfg=variable_names_cfg,
+                    original_quality_threshold=original_quality_threshold,
+                    debug_dir=debug_dir,
+                    run_id=run_id,
+                    file_id=file_id,
+                    plotting_cfg=step_plot_cfg,
+                    logger=logger,
+                )
+
 
             logger.debug("Analyzing cluster outputs...")
             cluster_results = analyze_scea_clusters(
@@ -898,6 +1707,19 @@ if __name__ == "__main__":
 
             cluster_results["file_id"] = file_id
             cluster_results["file_name"] = os.path.basename(files_info["files_path"][i])
+
+            if step_by_step:
+                plot_cluster_outputs_debug(
+                    preprocessed_data=data,
+                    clusters=clusters,
+                    cluster_results=cluster_results,
+                    variable_names_cfg=variable_names_cfg,
+                    debug_dir=debug_dir,
+                    run_id=run_id,
+                    file_id=file_id,
+                    plotting_cfg=step_plot_cfg,
+                    logger=logger,
+                )
 
             # Save results to csv, appending if file already exists
             logger.debug(f"Writing {len(cluster_results)} cluster records to CSV")
