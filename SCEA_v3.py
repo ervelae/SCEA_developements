@@ -2002,7 +2002,7 @@ def clusters_is_max_point_on_edge(clusters, max_point_indices, ignore_zero=True)
     for i, (row_idx, col_idx) in enumerate(max_point_indices):
         cluster_id = i + 1 if ignore_zero else i
         neighbors = clusters[max(0, row_idx-1):row_idx+2, max(0, col_idx-1):col_idx+2].flatten()
-        is_on_edge[i] = np.any((neighbors != cluster_id) & ~np.isnan(neighbors))
+        is_on_edge[i] = np.any((neighbors != cluster_id))
 
     return is_on_edge
 
