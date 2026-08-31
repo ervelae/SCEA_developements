@@ -2,6 +2,7 @@ import os
 from time import time
 import numpy as np
 from collections import OrderedDict
+from scipy.fftpack import fftshift
 from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import haversine_distances
 from sklearn import preprocessing
@@ -17,6 +18,7 @@ import geopandas as gpd
 from haversine import haversine_vector, Unit
 from scipy.spatial import KDTree
 import pandas as pd
+
 
 
 # --- Custom distance metric: directed half-ellipse ---
@@ -56,7 +58,7 @@ def geodesic_half_ellipse_dist(src_point, target_points, *,
                                distance_unit="km", dtype=np.float32):
     """
     Directed geodesic half-ellipse 'row' distance:
-    - src_point, target_points: (lat, lon) in DEGREES on WGS84.
+    - src_point, target_points: in (lon, lat) in DEGREES on WGS84.
     - Builds local E/N using geodesic azimuth + distance.
     - Applies half-ellipse in the local frame aligned by `rotation`.
 
@@ -65,15 +67,15 @@ def geodesic_half_ellipse_dist(src_point, target_points, *,
     from pyproj import Geod
     geod = Geod(ellps="WGS84")
 
-    x0, y0 = float(src_point[0]), float(src_point[1])  # lat, lon
-    lat = target_points[:, 0].astype(float, copy=False)
-    lon = target_points[:, 1].astype(float, copy=False)
+    x0, y0 = float(src_point[0]), float(src_point[1])  # lon, lat
+    lon = target_points[:, 0].astype(float, copy=False)
+    lat = target_points[:, 1].astype(float, copy=False)
 
     # Calculate distances and forward azimuth 
     # Forward azimuth: Initial angle from point a to point b (angle can change on an ellipsoid, thus "initial"). North is 0 deg, East is 90 deg, etc.
     az12_deg, _, dist_m = geod.inv(
-        np.full_like(lon, y0),  # lon1 returns [x0, x0, ...., x0]
-        np.full_like(lat, x0),  # lat1 returns [y0, y0, ...., y0]
+        np.full_like(lon, y0),  # lon returns [y0, y0, ...., y0]
+        np.full_like(lat, x0),  # lat returns [x0, x0, ...., x0]
         lon, # lon2 [x1, x2, ..., xn]
         lat, # lat2 [y1, y2, ..., yn]
     )
@@ -127,7 +129,7 @@ class RowDistanceCache:
                  include_sign=False, b=1.0, radius=6371.0,
                  symmetric=None, cross_fill=False):
         self.N = int(N)
-        self.coords = coords
+        self.coords = coords 
         self.metric = metric
         self.dtype = np.dtype(dtype)
 
@@ -253,11 +255,11 @@ class RowDistanceCache:
                 symmetric_metric = False
 
             elif m == "geodesic":
-                # Expect (lat, lon) in degrees
-                src_lat = float(P[0, 0])
-                src_lon = float(P[0, 1])
-                lat = Q[:, 0].astype(float, copy=False)
-                lon = Q[:, 1].astype(float, copy=False)
+                # Expect (lon, lat) in degrees
+                src_lon = float(P[0, 0])
+                src_lat = float(P[0, 1])
+                lon = Q[:, 0].astype(float, copy=False)
+                lat = Q[:, 1].astype(float, copy=False)
                 geod = Geod(ellps="WGS84")
                 _, _, dist_m = geod.inv(
                     np.full_like(lon, src_lon),
@@ -505,7 +507,9 @@ def print_cluster_stats(clusters, values):
 
 
 
-# ======================= SCEA main implementation ======================== #
+# ========================
+# SCEA main implementation 
+# ========================
 def scea(
     coords,
     values,
@@ -744,6 +748,7 @@ def scea(
 
 from scipy.ndimage import gaussian_filter, generic_filter, uniform_filter
 import xarray as xr
+from numpy.fft import fft2, ifft2, fftshift, ifftshift, fftfreq
 
 
 
@@ -812,8 +817,8 @@ def match_era5_wind_to_tropomi(tropomi_data, era5_data, era5_variables=['wind_ma
     # Select the nearest ERA5 grid point for each TROPOMI point in space and time, and extract the specified wind variables.
     for var in era5_variables:
         wind_data[var] = era5_data[var].sel(
-            latitude=tropomi_data.latitude,
             longitude=tropomi_data.longitude,
+            latitude=tropomi_data.latitude,
             time=tropomi_data.time_utc.broadcast_like(tropomi_data["longitude"][0]),
             method="nearest",
         )
@@ -842,7 +847,9 @@ def scale_wind_magnitude_for_distance_matrix(wind_magnitudes, method="linear", p
 
 
 
-# ==== Data preprocessing utilities ====
+# =============================
+# Data preprocessing utilities 
+# ============================
 
 # Crop TROPOMI dataset to given bbox
 def crop_to_bbox(
@@ -1017,6 +1024,56 @@ def local_standardization(da, window=11, eps=1e-12):
     standardized = np.where(mask > 0, standardized, np.nan)
     
     return standardized
+
+
+
+def local_m_standardization(da, window=11, eps=1e-12):
+    """
+    Local standardization using a sliding window.
+    """
+
+    # Windows must be odd to have a center pixel
+    if isinstance(window, int):
+        if window % 2 == 0:
+            raise ValueError("Window size must be odd.")
+    else:
+        if window[0] % 2 == 0 or window[1] % 2 == 0:
+            raise ValueError("Window sizes must be odd.")
+
+    # accept either DataArray or ndarray
+    data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
+
+    # Create a mask for finite values and fill NaNs with zeros for convolution
+    ## The mask will be used to correct the sums and counts to get the true local mean and std, while the filled data allows us to use uniform_filter without NaN issues.
+    mask = np.isfinite(data).astype(float)
+    data_filled = np.where(np.isfinite(data), data, 0.0)
+
+    # Compute local sums and sums of squares using uniform_filter, which gives us the total sum in each window. We will divide by the effective count of valid points (from the mask) to get the mean and variance.
+    sum_ = uniform_filter(data_filled, window) * (window ** 2)
+    sumsq = uniform_filter(data_filled**2, window) * (window ** 2)
+
+    # The effective number of valid points in each window (the sum of the mask) is needed to compute the mean and variance correctly, since uniform_filter will treat NaNs as zeros.
+    w = uniform_filter(mask, window) * (window ** 2)
+
+    # Compute local mean and variance, correcting for the number of valid points. Where w is zero (no valid points), we set mean and std to NaN.
+    mean = np.where(w > 0, sum_ / (w+eps), np.nan)
+
+
+    # Deviation from every points own local mean
+    deviation_sq = (data_filled - mean)**2
+
+    # Sum the squared deviations in the local window and take the square root
+    var_m = np.where(w > 0, uniform_filter(deviation_sq, window) * (window ** 2) / (w+eps), np.nan)
+    std_m = np.sqrt(np.maximum(var_m, 0.0))
+
+    standardized = (data - mean) / (std_m + eps)
+
+    # zero values back to NaN
+    standardized = np.where(mask > 0, standardized, np.nan)
+    
+    return standardized
+
+
 
 
 def nanmedian_filter(data, window):
@@ -1454,28 +1511,39 @@ def local_standardization_mad(da, window=11, eps=0, scaling_factor=1.4826, use_n
     return np.where(np.isfinite(standardized), standardized, np.nan)
 
 
-def denoise_butterworth(data, cutoff=40, order=2):
-    """Applies a Butterworth low-pass filter to the data. This can help to reduce high-frequency noise
-    
+def butterworth_lowpass_kernel(shape, cutoff, order=2):
+    if cutoff <= 0:
+        return np.ones(shape, dtype=float)
+
+    ny, nx = shape
+    fy = fftshift(fftfreq(ny))  # the actual frequency values for the y-axis (rows), shifted so that zero frequency is in the center
+    fx = fftshift(fftfreq(nx))  # the actual frequency values for the x-axis (columns), shifted so that zero frequency is in the center
+    FY, FX = np.meshgrid(fy, fx, indexing="ij") # create a meshgrid for the frequency values
+    D = np.sqrt(FX**2 + FY**2) # compute the distance from the center of the frequency domain
+    H = 1 / (1 + (D / cutoff)**(2 * order)) # Butterworth filter transfer function
+    return H
+
+def butterworth_highpass_kernel(shape, cutoff, order=2):
+    if cutoff <= 0:
+        return np.ones(shape, dtype=float)
+
+    ny, nx = shape
+    fy = fftshift(fftfreq(ny))  # the actual frequency values for the y-axis (rows), shifted so that zero frequency is in the center
+    fx = fftshift(fftfreq(nx))  # the actual frequency values for the x-axis (columns), shifted so that zero frequency is in the center
+    FY, FX = np.meshgrid(fy, fx, indexing="ij") # create a meshgrid for the frequency values
+    D = np.sqrt(FX**2 + FY**2) # compute the distance from the center of the frequency domain
+    H = 1 - (1 / (1 + (D / cutoff)**(2 * order))) #   # Butterworth high-pass filter transfer function
+    return H
+
+
+def butterworth_lowpass(data, cutoff=0.4, order=1):
     """
-    from numpy.fft import fft2, ifft2, fftshift, ifftshift
+    Applies a Butterworth low-pass filter to the data. This can help to reduce high-frequency noise.
 
-    # TODO make suitable for inputs with very different aspect ratios by allowing different cutoff frequencies for x and y dimensions, and adjusting the kernel accordingly.
-    def butterworth_lowpass_kernel(shape, cutoff, order=2):
-        ny, nx = shape
-        cy, cx = ny // 2, nx // 2
-        Y, X = np.ogrid[:ny, :nx]
-        D = np.sqrt((Y - cy)**2 + (X - cx)**2)
-        
-        H = 1 / (1 + (D / cutoff)**(2 * order))
-        return H
-    
-    # accept either DataArray or ndarray
-    #data = da.values[0] if isinstance(da, xr.DataArray) else np.asarray(da)
-
+    cutoff: [0, 0.5]
+    """
     mask = np.isfinite(data)
     data_filled = np.where(mask, data, 0.0)
-
 
     kernel = butterworth_lowpass_kernel(data.shape, cutoff, order)
     data_fft = fft2(data_filled)
@@ -1485,16 +1553,98 @@ def denoise_butterworth(data, cutoff=40, order=2):
 
     return np.where(mask, data_filtered, np.nan)
     
-    
+
+def butterworth_highpass(data, cutoff=0.05, order=1):
+    """
+    Applies a Butterworth high-pass filter to the data. This can help to remove low-frequency trends.
+
+    cutoff: [0, 0.5]
+    """
+    mask = np.isfinite(data)
+    data_filled = np.where(mask, data, 0.0)
+
+    kernel = butterworth_highpass_kernel(data.shape, cutoff, order)
+    data_fft = fft2(data_filled)
+    data_fft_shifted = fftshift(data_fft)
+    filtered_fft = data_fft_shifted * kernel
+    data_filtered = np.real(ifft2(ifftshift(filtered_fft)))
+
+    return np.where(mask, data_filtered, np.nan)
 
 
-def combine_standardizations(da, standardizations, coefficients):
+def butterworth_bandpass(data, lowpass_cutoff=0.45, highpass_cutoff=0.05, high_order=1, low_order=1):
+    """
+    Applies a Butterworth band-pass filter to the data. This can help to isolate specific frequency bands.
+
+    low_cutoff: [0, 0.5]
+    high_cutoff: [0, 0.5]
+    """
+    mask = np.isfinite(data)
+    data_filled = np.where(mask, data, 0.0)
+
+    if lowpass_cutoff is not None:
+        lowpass_kernel = butterworth_lowpass_kernel(data.shape, lowpass_cutoff, low_order)
+        kernel = lowpass_kernel
+    if highpass_cutoff is not None:
+        highpass_kernel = butterworth_highpass_kernel(data.shape, highpass_cutoff, high_order)
+        kernel = highpass_kernel
+
+    if lowpass_cutoff is not None and highpass_cutoff is not None:
+        kernel = lowpass_kernel * highpass_kernel
+
+    data_fft = fft2(data_filled)
+    data_fft_shifted = fftshift(data_fft)
+    filtered_fft = data_fft_shifted * kernel
+    data_filtered = np.real(ifft2(ifftshift(filtered_fft)))
+
+    return np.where(mask, data_filtered, np.nan)
+
+
+def combine_standardizations(da, standardizations, window_sizes, coefficients):
     """
     Combines multiple standardized arrays using weighted coefficients.
     """
-    # TODO
-    raise NotImplementedError("combine_standardizations not implemented yet")
+    result = np.zeros_like(da)
+    for std, win, coeff in zip(standardizations, window_sizes, coefficients):
+        if std == "local_standardization":
+            da_std = local_standardization(da, window=win)
+        elif std == "local_standardization_mad":
+            da_std = local_standardization_mad(da, window=win)
+        elif std == "local_standardization_m_mad":
+            da_std = local_standardization_m_mad(da, window=win)
+        else:
+            raise ValueError(f"Unknown standardization method: {std}, choose from ['local_standardization', 'local_standardization_mad', 'local_standardization_m_mad']")
 
+        da_std = da_std * coeff  # Apply coefficient to the standardized array
+        result += da_std
+
+    return result
+
+
+def normalize_singleton_leading_dim(data, variable_names_cfg, logger=None, verbose=True) -> xr.Dataset:
+    #if logger is None:
+    #    logger = logging.getLogger("scea_plume_detection")
+    """
+    Normalize value field shape from [1, x, y] -> [x, y].
+    If leading dim is >1, fail fast to avoid silently dropping data.
+    """
+    value_var = variable_names_cfg["value"]
+    da = data[value_var]
+
+    if da.ndim <= 2:
+        return data
+
+    lead_dim = da.dims[0]
+    lead_size = da.sizes[lead_dim]
+
+    if lead_size == 1:
+        if verbose: print(f"Squeezing singleton leading dimension '{lead_dim}' for '{value_var}'.")
+        return data.isel({lead_dim: 0})
+
+    raise ValueError(
+    f"Expected singleton leading dimension for '{value_var}', "
+    f"but got {lead_dim} size {lead_size} with shape {da.shape}."
+    )
 
 
 # ==== Wrapper for preprocessing methods ====
@@ -1515,10 +1665,16 @@ def preprocess_data_xr(da, method=None, kwargs=None, variable_names=None, verbos
         da[variable_names["value"]].values = local_standardization_m_mad(da[variable_names["value"]].values, **kwargs)
         return da
     elif method == "combine_standardizations":
-        da[variable_names["value"]].values = combine_standardizations(da[variable_names["value"]].values, **kwargs) # TODO implement
+        da[variable_names["value"]].values = combine_standardizations(da[variable_names["value"]].values, **kwargs)
         return da
-    elif method == "denoise_butterworth":
-        da[variable_names["value"]].values = denoise_butterworth(da[variable_names["value"]].values, **kwargs)
+    elif method == "butterworth_lowpass":
+        da[variable_names["value"]].values = butterworth_lowpass(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "butterworth_highpass":
+        da[variable_names["value"]].values = butterworth_highpass(da[variable_names["value"]].values, **kwargs)
+        return da
+    elif method == "butterworth_bandpass":
+        da[variable_names["value"]].values = butterworth_bandpass(da[variable_names["value"]].values, **kwargs)
         return da
     elif method == "nan_gaussian_filter":
         da[variable_names["value"]].values = nan_gaussian_filter(da[variable_names["value"]].values, **kwargs)
@@ -1529,6 +1685,8 @@ def preprocess_data_xr(da, method=None, kwargs=None, variable_names=None, verbos
         return quality_filter(da, qa_var=variable_names["quality"], value_var=variable_names["value"], verbose=verbose, **kwargs)
     elif method == "discard_small_files":
         return discard_files_smaller_than(da, variable_name=variable_names["value"], verbose=verbose, **kwargs)
+    elif method == "normalize_singleton_leading_dim":
+        return normalize_singleton_leading_dim(da, variable_names_cfg=variable_names, verbose=verbose)
     elif method == "regrid_with_harp": 
         raise NotImplementedError("regrid_with_harp method not implemented yet")
     elif method == "quality_filter":
@@ -2178,6 +2336,7 @@ def clusters_mean_q_value(clusters, qa_values, ignore_zero=True):
     return means[1:] if ignore_zero else means
 
 
+
 # Wrapper for cluster analysis methods
 def analyze_clusters(method, clusters, lon=None, lat=None, values=None, timestamps=None, qa_values=None, variable_names=None, max_point_indices=None, ignore_zero=True, verbose=False, filename=None, **kwargs):
     """ """
@@ -2236,12 +2395,16 @@ def analyze_clusters(method, clusters, lon=None, lat=None, values=None, timestam
 
 # ==================================================================================================================================================================================================================================================
 
+# ====================================
+# Interactive SCEA visualization and analysis
+# ====================================
 
 def scea_interactive(
-        lon, lat, value,  
+        data=None, lon=None, lat=None, value=None,  
         windows_list = [9, 11, 13, 15, 21, 31, 51, 101, 151, 201, 301, 501],
         wind_data=None,
         use_numba=True,
+        qa_value=0.74
 ):
     
     # Interactive multi-scale sliders + optional SCEA run (extended with per-scale denoise)
@@ -2251,6 +2414,96 @@ def scea_interactive(
     from IPython.display import display
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
+
+    def _dataset_name(source, index):
+        if hasattr(source, "attrs"):
+            for key in ("title", "name", "dataset_name", "id"):
+                if key in source.attrs and source.attrs[key]:
+                    return str(source.attrs[key])
+        return f"dataset {index + 1}"
+
+    def _extract_dataset(source):
+        if hasattr(source, "data_vars") and hasattr(source, "coords"):
+            source_lon = source["longitude"][0].data
+            source_lat = source["latitude"][0].data
+            qa_mask = (source["qa_value"] > qa_value)[0]
+            source_value = source["nitrogendioxide_tropospheric_column"][0].data
+            source_value = np.where(qa_mask, source_value, np.nan)
+            return {
+                "lon": source_lon,
+                "lat": source_lat,
+                "value": source_value,
+                "name": _dataset_name(source, 0),
+            }
+        if isinstance(source, dict):
+            return {
+                "lon": source["lon"],
+                "lat": source["lat"],
+                "value": source["value"],
+                "name": str(source.get("name", "dataset")),
+            }
+        raise TypeError("Unsupported dataset source")
+
+    dataset_records = []
+    if data is not None:
+        is_dataset_sequence = isinstance(data, (list, tuple)) or (isinstance(data, np.ndarray) and data.dtype == object and data.ndim == 1)
+        if is_dataset_sequence:
+            for index, item in enumerate(list(data)):
+                if hasattr(item, "data_vars") and hasattr(item, "coords"):
+                    source_lon = item["longitude"][0].data
+                    source_lat = item["latitude"][0].data
+                    qa_mask = (item["qa_value"] > qa_value)[0]
+                    source_value = item["nitrogendioxide_tropospheric_column"][0].data
+                    source_value = np.where(qa_mask, source_value, np.nan)
+                    dataset_records.append({
+                        "lon": source_lon,
+                        "lat": source_lat,
+                        "value": source_value,
+                        "name": _dataset_name(item, index),
+                    })
+                else:
+                    dataset_records.append(_extract_dataset(item))
+        else:
+            dataset_records.append(_extract_dataset(data))
+    else:
+        if isinstance(lon, (list, tuple)) and isinstance(lat, (list, tuple)) and isinstance(value, (list, tuple)):
+            if not (len(lon) == len(lat) == len(value)):
+                raise ValueError("lon, lat, and value must have the same number of datasets")
+            for index, (lon_item, lat_item, value_item) in enumerate(zip(lon, lat, value)):
+                dataset_records.append({
+                    "lon": np.asarray(lon_item),
+                    "lat": np.asarray(lat_item),
+                    "value": np.asarray(value_item),
+                    "name": f"dataset {index + 1}",
+                })
+        else:
+            dataset_records.append({
+                "lon": np.asarray(lon),
+                "lat": np.asarray(lat),
+                "value": np.asarray(value),
+                "name": "dataset 1",
+            })
+
+    if not dataset_records:
+        raise ValueError("No input data provided to scea_interactive")
+
+    active_dataset = {"index": 0}
+
+    def get_active_dataset():
+        return dataset_records[active_dataset["index"]]
+
+    def set_active_dataset(index):
+        active_dataset["index"] = int(index)
+        standardized_cache.clear()
+        last["combined"] = None
+        cluster_store.clear()
+        cluster_counter["n"] = 0
+        cluster_select.options = [("None", "none")]
+        cluster_select.value = "none"
+        show_clusters.value = False
+        update_plot()
+
+
 
     print(""" TODO
 Instructions:
@@ -2263,6 +2516,9 @@ Instructions:
         local_box_radius: Radius of the local window (in coordinate units) that are considered for each seed point when creating a cluster. Larger windows are computationally more expensive.
         max_pts_start_radius: Approximately, larger value -> jumps bigger gaps. The number sets a threshold for the maximum numbe of clustered points that can be within the starting radius of a point. If there are more points than this threshold, the point will not enlargen the cluster.
           """)
+
+
+    
 
     compact_layout = Layout(width='130px')
     less_compact_layout = Layout(width='140px')
@@ -2285,14 +2541,23 @@ Instructions:
         layout=Layout(width='240px')
     )
 
+    dataset_select = None
+    if len(dataset_records) > 1:
+        dataset_select = Dropdown(
+            options=[(record["name"], str(index)) for index, record in enumerate(dataset_records)],
+            value="0",
+            description="Dataset:",
+            layout=Layout(width='240px')
+        )
+
     std_type_options = [("standardization", "standard"), ("median_MAD", "median_mad")]
-    std_type_small  = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
-    std_type_medium = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
+    std_type_small  = Dropdown(options=std_type_options, value="median_mad", description="std_type", layout=less_compact_layout)
+    std_type_medium = Dropdown(options=std_type_options, value="median_mad", description="std_type", layout=less_compact_layout)
     std_type_large  = Dropdown(options=std_type_options, value="standard", description="std_type", layout=less_compact_layout)
 
     # --- scale/window controls ---
-    w_small = Dropdown(options=windows_list, value=9, description="window_s", layout=less_compact_layout)
-    w_med   = Dropdown(options=windows_list, value=13, description="window_s", layout=less_compact_layout)
+    w_small = Dropdown(options=windows_list, value=13, description="window_s", layout=less_compact_layout)
+    w_med   = Dropdown(options=windows_list, value=21, description="window_s", layout=less_compact_layout)
     w_large = Dropdown(options=windows_list, value=501, description="window_s", layout=less_compact_layout)
 
     c_small = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
@@ -2305,23 +2570,114 @@ Instructions:
     use_large = Checkbox(value=True, description="LARGE WINDOW", layout=Layout(width='220px'))
     use_raw = Checkbox(value=False, description="RAW DATA", layout=Layout(width='220px'))
 
-    # --- per-scale pre-denoise controls ---
-    denoise_pre_small = Checkbox(value=False, description="denoise_pre", layout=Layout(width='210px'))
-    denoise_pre_medium = Checkbox(value=False, description="denoise_pre", layout=Layout(width='210px'))
-    denoise_pre_large = Checkbox(value=True, description="denoise_pre", layout=Layout(width='210px'))
+    filter_type_options = [
+        ("None", "none"),
+        ("Gaussian", "gaussian"),
+        ("Butterworth bandpass", "butterworth_bandpass"),
+    ]
+
+    # --- per-scale pre-filter controls ---
+    pre_filter_small = Dropdown(options=filter_type_options, value="butterworth_bandpass", description="pre", layout=Layout(width='180px'))
+    pre_filter_medium = Dropdown(options=filter_type_options, value="none", description="pre", layout=Layout(width='180px'))
+    pre_filter_large = Dropdown(options=filter_type_options, value="gaussian", description="pre", layout=Layout(width='180px'))
 
     sigma_pre_small = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
     sigma_pre_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
     sigma_pre_large = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
 
-    # --- per-scale post-denoise controls ---
-    denoise_post_small = Checkbox(value=False, description="denoise_post", layout=Layout(width='210px'))
-    denoise_post_medium = Checkbox(value=True, description="denoise_post", layout=Layout(width='210px'))
-    denoise_post_large = Checkbox(value=False, description="denoise_post", layout=Layout(width='210px'))
+    param_label_layout = Layout(width='60px')
+    param_selector_layout = Layout(width='150px')
+    param_value_layout = Layout(width='140px')
+
+    pre_param_mode_small = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+    pre_param_mode_medium = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+    pre_param_mode_large = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+
+    pre_sigma_small = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+    pre_sigma_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+    pre_sigma_large = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+
+    pre_lcut_small = BoundedFloatText(value=0, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+    pre_lcut_medium = BoundedFloatText(value=0, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+    pre_lcut_large = BoundedFloatText(value=0, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+
+    pre_hcut_small = BoundedFloatText(value=0.01, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+    pre_hcut_medium = BoundedFloatText(value=0.01, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+    pre_hcut_large = BoundedFloatText(value=0.01, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+
+    pre_order_small = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+    pre_order_medium = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+    pre_order_large = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+
+    pre_high_order_small = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+    pre_high_order_medium = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+    pre_high_order_large = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+
+    # --- per-scale post-filter controls ---
+    post_filter_small = Dropdown(options=filter_type_options, value="butterworth_bandpass", description="post", layout=Layout(width='180px'))
+    post_filter_medium = Dropdown(options=filter_type_options, value="butterworth_bandpass", description="post", layout=Layout(width='180px'))
+    post_filter_large = Dropdown(options=filter_type_options, value="none", description="post", layout=Layout(width='180px'))
 
     sigma_post_small = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
     sigma_post_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
     sigma_post_large = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+
+    post_param_mode_small = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+    post_param_mode_medium = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+    post_param_mode_large = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+
+    post_sigma_small = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+    post_sigma_medium = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+    post_sigma_large = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+
+    post_lcut_small = BoundedFloatText(value=0.45, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+    post_lcut_medium = BoundedFloatText(value=0.45, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+    post_lcut_large = BoundedFloatText(value=0.45, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+
+    post_hcut_small = BoundedFloatText(value=0, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+    post_hcut_medium = BoundedFloatText(value=0, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+    post_hcut_large = BoundedFloatText(value=0, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+
+    post_order_small = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+    post_order_medium = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+    post_order_large = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+
+    post_high_order_small = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+    post_high_order_medium = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+    post_high_order_large = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+
+    # Keep the existing variable names used later in the function.
+    sigma_pre_small = pre_sigma_small
+    sigma_pre_medium = pre_sigma_medium
+    sigma_pre_large = pre_sigma_large
+    bp_pre_low_cutoff_small = pre_lcut_small
+    bp_pre_low_cutoff_medium = pre_lcut_medium
+    bp_pre_low_cutoff_large = pre_lcut_large
+    bp_pre_high_cutoff_small = pre_hcut_small
+    bp_pre_high_cutoff_medium = pre_hcut_medium
+    bp_pre_high_cutoff_large = pre_hcut_large
+    bp_pre_order_small = pre_order_small
+    bp_pre_order_medium = pre_order_medium
+    bp_pre_order_large = pre_order_large
+    bp_pre_high_order_small = pre_high_order_small
+    bp_pre_high_order_medium = pre_high_order_medium
+    bp_pre_high_order_large = pre_high_order_large
+
+    sigma_post_small = post_sigma_small
+    sigma_post_medium = post_sigma_medium
+    sigma_post_large = post_sigma_large
+    bp_post_low_cutoff_small = post_lcut_small
+    bp_post_low_cutoff_medium = post_lcut_medium
+    bp_post_low_cutoff_large = post_lcut_large
+    bp_post_high_cutoff_small = post_hcut_small
+    bp_post_high_cutoff_medium = post_hcut_medium
+    bp_post_high_cutoff_large = post_hcut_large
+    bp_post_order_small = post_order_small
+    bp_post_order_medium = post_order_medium
+    bp_post_order_large = post_order_large
+    bp_post_high_order_small = post_high_order_small
+    bp_post_high_order_medium = post_high_order_medium
+    bp_post_high_order_large = post_high_order_large
 
     # --- overlay controls ---
     show_clusters = Checkbox(value=False, description="overlay clusters", layout=Layout(width='210px'))
@@ -2338,12 +2694,21 @@ Instructions:
         description='OVERLAY: ',
         layout=Layout(width='240px')
     )
+    vmin_q = BoundedFloatText(value=0.001, min=0.0, max=1.0, step=0.001, description="vmin_q", layout=Layout(width="145px"))
     vmax_q = BoundedFloatText(value=0.999, min=0.0, max=1.0, step=0.001, description="vmax_q", layout=Layout(width="145px"))
 
 
     # --- raw data controls ---
-    denoise_raw = Checkbox(value=False, description="denoise_raw", layout=Layout(width='210px'))
-    sigma_raw = FloatText(value=1.0, step=0.2, description="sigma", layout=compact_layout)
+    raw_pre_filter = Dropdown(options=filter_type_options, value="none", description="pre", layout=Layout(width='180px'))
+
+    raw_pre_param_mode = Dropdown(options=[("sigma", "sigma"), ("lowpass cutoff", "lcut"), ("highpass cutoff", "hcut"), ("order", "order")], value="sigma", description="param", layout=param_selector_layout)
+
+    raw_pre_sigma = FloatText(value=1.0, step=0.2, description="sigma", layout=param_value_layout)
+    raw_pre_lcut = BoundedFloatText(value=0.4, min=0.0, step=0.01, description="lcut", layout=param_value_layout)
+    raw_pre_hcut = BoundedFloatText(value=0.05, min=0.0, step=0.01, description="hcut", layout=param_value_layout)
+    raw_pre_low_order = IntText(value=1, step=0.1, description="low_order", layout=param_value_layout)
+    raw_pre_high_order = IntText(value=1, step=0.1, description="high_order", layout=param_value_layout)
+
     c_raw = FloatText(value=1.0, step=0.1, description="coef", layout=compact_layout)
 
     # --- SCEA controls (text boxes) ---
@@ -2375,26 +2740,70 @@ Instructions:
 
     overlay_wind_arrows = Checkbox(value=False, description="overlay wind arrows", layout=Layout(width='230px'))
 
-    def apply_denoise(arr, sigma=1.5):
-        return nan_gaussian_filter(arr, sigma=float(sigma))
+    def make_parameter_switcher(mode_widget, widgets_by_mode):
+        def _value_box(widget_or_widgets):
+            if isinstance(widget_or_widgets, (tuple, list)):
+                return HBox(list(widget_or_widgets), layout=Layout(width='fit-content', gap='2px'))
+            return HBox([widget_or_widgets], layout=Layout(width='fit-content'))
 
-    def get_local_standardization(window, std_type_val, denoise_pre_flag, sigma_pre_val, denoise_post_flag, sigma_post_val):
+        value_box = _value_box(widgets_by_mode[mode_widget.value])
+
+        def _sync_value_box(change):
+            value_box.children = _value_box(widgets_by_mode[change["new"]]).children
+
+        mode_widget.observe(_sync_value_box, names="value")
+        return HBox([mode_widget, value_box], layout=Layout(width='fit-content'))
+
+    def apply_filter(arr, filter_mode="none", sigma=1.5, low_cutoff=0.4, high_cutoff=0.05, low_order=2, high_order=2):
+        filter_mode = str(filter_mode)
+        if filter_mode == "none":
+            return np.asarray(arr)
+        if filter_mode == "gaussian":
+            return nan_gaussian_filter(arr, sigma=float(sigma))
+        if filter_mode == "butterworth_bandpass":
+            return butterworth_bandpass(
+                arr,
+                lowpass_cutoff=float(low_cutoff),
+                highpass_cutoff=float(high_cutoff),
+                high_order=int(high_order),
+                low_order=int(low_order),
+            )
+        raise ValueError(f"Unknown filter mode: {filter_mode}")
+
+    def get_local_standardization(base_value, window, std_type_val,
+                                     pre_filter_mode, sigma_pre_val, bp_pre_low_cutoff_val, bp_pre_high_cutoff_val, bp_pre_low_order_val, bp_pre_high_order_val,
+                                     post_filter_mode, sigma_post_val, bp_post_low_cutoff_val, bp_post_high_cutoff_val, bp_post_low_order_val, bp_post_high_order_val):
         key = (
             int(window),
             str(std_type_val),
-            bool(denoise_pre_flag),
+            str(pre_filter_mode),
             round(float(sigma_pre_val), 3),
-            bool(denoise_post_flag),
+            round(float(bp_pre_low_cutoff_val), 3),
+            round(float(bp_pre_high_cutoff_val), 3),
+            int(bp_pre_low_order_val),
+            int(bp_pre_high_order_val),
+            str(post_filter_mode),
             round(float(sigma_post_val), 3),
+            round(float(bp_post_low_cutoff_val), 3),
+            round(float(bp_post_high_cutoff_val), 3),
+            int(bp_post_low_order_val),
+            int(bp_post_high_order_val),
         )
         if key in standardized_cache:
             return standardized_cache[key]
 
-        base = value
+        base = base_value
         
         # Pre-denoise
-        if denoise_pre_flag:
-            base = apply_denoise(base, sigma=sigma_pre_val)
+        base = apply_filter(
+            base,
+            filter_mode=pre_filter_mode,
+            sigma=sigma_pre_val,
+            low_cutoff=bp_pre_low_cutoff_val,
+            high_cutoff=bp_pre_high_cutoff_val,
+            low_order=bp_pre_low_order_val,
+            high_order=bp_pre_high_order_val,
+        )
         
         # Standardize
         if std_type_val == "median_mad":
@@ -2403,34 +2812,49 @@ Instructions:
             arr = np.asarray(local_standardization(base, window=int(window)))
 
         # Post-denoise
-        if denoise_post_flag:
-            arr = apply_denoise(arr, sigma=sigma_post_val)
+        arr = apply_filter(
+            arr,
+            filter_mode=post_filter_mode,
+            sigma=sigma_post_val,
+            low_cutoff=bp_post_low_cutoff_val,
+            high_cutoff=bp_post_high_cutoff_val,
+            low_order=bp_post_low_order_val,
+            high_order=bp_post_high_order_val,
+        )
         
         standardized_cache[key] = arr
         return arr
 
 
     def render_combined():
+        active_data = get_active_dataset()
         s = get_local_standardization(
-            w_small.value, std_type_small.value,
-            denoise_pre_small.value, sigma_pre_small.value,
-            denoise_post_small.value, sigma_post_small.value
+            active_data["value"], w_small.value, std_type_small.value,
+            pre_filter_small.value, sigma_pre_small.value, bp_pre_low_cutoff_small.value, bp_pre_high_cutoff_small.value, bp_pre_order_small.value, bp_pre_high_order_small.value,
+            post_filter_small.value, sigma_post_small.value, bp_post_low_cutoff_small.value, bp_post_high_cutoff_small.value, bp_post_order_small.value, bp_post_high_order_small.value,
         )
         m = get_local_standardization(
-            w_med.value, std_type_medium.value,
-            denoise_pre_medium.value, sigma_pre_medium.value,
-            denoise_post_medium.value, sigma_post_medium.value
+            active_data["value"], w_med.value, std_type_medium.value,
+            pre_filter_medium.value, sigma_pre_medium.value, bp_pre_low_cutoff_medium.value, bp_pre_high_cutoff_medium.value, bp_pre_order_medium.value, bp_pre_high_order_medium.value,
+            post_filter_medium.value, sigma_post_medium.value, bp_post_low_cutoff_medium.value, bp_post_high_cutoff_medium.value, bp_post_order_medium.value, bp_post_high_order_medium.value,
         )
         l = get_local_standardization(
-            w_large.value, std_type_large.value,
-            denoise_pre_large.value, sigma_pre_large.value,
-            denoise_post_large.value, sigma_post_large.value
+            active_data["value"], w_large.value, std_type_large.value,
+            pre_filter_large.value, sigma_pre_large.value, bp_pre_low_cutoff_large.value, bp_pre_high_cutoff_large.value, bp_pre_order_large.value, bp_pre_high_order_large.value,
+            post_filter_large.value, sigma_post_large.value, bp_post_low_cutoff_large.value, bp_post_high_cutoff_large.value, bp_post_order_large.value, bp_post_high_order_large.value,
         )
         
         # Raw data (optionally denoised)
-        raw = value
-        if denoise_raw.value:
-            raw = apply_denoise(raw, sigma=sigma_raw.value)
+        raw = active_data["value"]
+        raw = apply_filter(
+            raw,
+            filter_mode=raw_pre_filter.value,
+            sigma=raw_pre_sigma.value,
+            low_cutoff=raw_pre_lcut.value,
+            high_cutoff=raw_pre_hcut.value,
+            low_order=raw_pre_low_order.value,
+            high_order=raw_pre_high_order.value,
+        )
         # Standardize raw to match the scale of s/m/l
         raw = (raw - np.nanmean(raw)) / (np.nanstd(raw) + 1e-12)
 
@@ -2446,23 +2870,24 @@ Instructions:
 
     def update_plot(*_):
         
+        active_data = get_active_dataset()
         combined = render_combined()
 
         # Get standardized data for each scale
         s = get_local_standardization(
-            w_small.value, std_type_small.value,
-            denoise_pre_small.value, sigma_pre_small.value,
-            denoise_post_small.value, sigma_post_small.value
+            active_data["value"], w_small.value, std_type_small.value,
+            pre_filter_small.value, sigma_pre_small.value, bp_pre_low_cutoff_small.value, bp_pre_high_cutoff_small.value, bp_pre_order_small.value, bp_pre_high_order_small.value,
+            post_filter_small.value, sigma_post_small.value, bp_post_low_cutoff_small.value, bp_post_high_cutoff_small.value, bp_post_order_small.value, bp_post_high_order_small.value,
         )
         m = get_local_standardization(
-            w_med.value, std_type_medium.value,
-            denoise_pre_medium.value, sigma_pre_medium.value,
-            denoise_post_medium.value, sigma_post_medium.value
+            active_data["value"], w_med.value, std_type_medium.value,
+            pre_filter_medium.value, sigma_pre_medium.value, bp_pre_low_cutoff_medium.value, bp_pre_high_cutoff_medium.value, bp_pre_order_medium.value, bp_pre_high_order_medium.value,
+            post_filter_medium.value, sigma_post_medium.value, bp_post_low_cutoff_medium.value, bp_post_high_cutoff_medium.value, bp_post_order_medium.value, bp_post_high_order_medium.value,
         )
         l = get_local_standardization(
-            w_large.value, std_type_large.value,
-            denoise_pre_large.value, sigma_pre_large.value,
-            denoise_post_large.value, sigma_post_large.value
+            active_data["value"], w_large.value, std_type_large.value,
+            pre_filter_large.value, sigma_pre_large.value, bp_pre_low_cutoff_large.value, bp_pre_high_cutoff_large.value, bp_pre_order_large.value, bp_pre_high_order_large.value,
+            post_filter_large.value, sigma_post_large.value, bp_post_low_cutoff_large.value, bp_post_high_cutoff_large.value, bp_post_order_large.value, bp_post_high_order_large.value,
         )
         
         with out:
@@ -2471,7 +2896,7 @@ Instructions:
             
             # Determine what to display based on overlay_option
             if overlay_option.value == 'raw':
-                display_data = value
+                display_data = active_data["value"]
                 title_suffix = "Raw Data"
             elif overlay_option.value == 'small':
                 display_data = s
@@ -2488,10 +2913,20 @@ Instructions:
             
             # Only plot if not 'none'
             if overlay_option.value != 'none':
+                finite_display = display_data[np.isfinite(display_data)]
+                if finite_display.size:
+                    vmin_val = np.nanquantile(finite_display, q=float(vmin_q.value))
+                    vmax_val = np.nanquantile(finite_display, q=float(vmax_q.value))
+                    if vmin_val > vmax_val:
+                        vmin_val, vmax_val = vmax_val, vmin_val
+                else:
+                    vmin_val, vmax_val = None, None
+
                 pcm = ax.pcolormesh(
-                    lon, lat, display_data,
+                    active_data["lon"], active_data["lat"], display_data,
                     shading="auto",
-                    vmax=np.nanquantile(display_data[~np.isnan(display_data)], q=float(vmax_q.value)),
+                    vmin=vmin_val,
+                    vmax=vmax_val,
                     transform=ccrs.PlateCarree(),
                     cmap="cmc.batlow"
                 )
@@ -2508,7 +2943,7 @@ Instructions:
 
             if show_clusters.value and selected_clusters is not None:
                 ax.pcolormesh(
-                    lon, lat,
+                    active_data["lon"], active_data["lat"],
                     np.where(selected_clusters > 0, selected_clusters, np.nan),
                     shading="auto",
                     transform=ccrs.PlateCarree(),
@@ -2540,7 +2975,7 @@ Instructions:
                 v = mag_scaled * np.sin(angle)
 
                 ax.quiver(
-                    lon[skip], lat[skip],
+                    active_data["lon"][skip], active_data["lat"][skip],
                     u[skip], v[skip],
                     transform=ccrs.PlateCarree(),
                     color="black",
@@ -2565,7 +3000,8 @@ Instructions:
 
         combined = last.get("combined") if last.get("combined") is not None else render_combined()
 
-        point_coordinates = [lon, lat]
+        active_data = get_active_dataset()
+        point_coordinates = [active_data["lon"], active_data["lat"]]
 
         # default SCEA args (no wind)
         scea_kwargs = dict(
@@ -2618,17 +3054,32 @@ Instructions:
         w_small, w_med, w_large, c_small, c_med, c_large,
         std_type_small, std_type_medium, std_type_large,
         use_small, use_medium, use_large, use_raw,
-        denoise_pre_small, denoise_pre_medium, denoise_pre_large,
+        pre_filter_small, pre_filter_medium, pre_filter_large,
         sigma_pre_small, sigma_pre_medium, sigma_pre_large,
-        denoise_post_small, denoise_post_medium, denoise_post_large,
+        bp_pre_low_cutoff_small, bp_pre_low_cutoff_medium, bp_pre_low_cutoff_large,
+        bp_pre_high_cutoff_small, bp_pre_high_cutoff_medium, bp_pre_high_cutoff_large,
+        bp_pre_order_small, bp_pre_order_medium, bp_pre_order_large,
+        bp_pre_high_order_small, bp_pre_high_order_medium, bp_pre_high_order_large,
+        post_filter_small, post_filter_medium, post_filter_large,
         sigma_post_small, sigma_post_medium, sigma_post_large,
-        denoise_raw, sigma_raw, c_raw,
+        bp_post_low_cutoff_small, bp_post_low_cutoff_medium, bp_post_low_cutoff_large,
+        bp_post_high_cutoff_small, bp_post_high_cutoff_medium, bp_post_high_cutoff_large,
+        bp_post_order_small, bp_post_order_medium, bp_post_order_large,
+        bp_post_high_order_small, bp_post_high_order_medium, bp_post_high_order_large,
+        raw_pre_filter,
+        raw_pre_param_mode,
+        raw_pre_sigma, raw_pre_lcut, raw_pre_hcut, raw_pre_low_order, raw_pre_high_order,
+        c_raw,
         use_wind, wind_level, wind_scale_method, wind_scale_param,
     ):
         widget.observe(mark_clusters_stale, names="value")
 
+    if dataset_select is not None:
+        dataset_select.observe(lambda change: set_active_dataset(int(change["new"])), names="value")
+
     # Overlay and cluster visibility changes
     overlay_option.observe(update_plot, names="value")
+    vmin_q.observe(update_plot, names="value")
     vmax_q.observe(update_plot, names="value")
     show_clusters.observe(update_plot, names="value")
     overlay_wind_arrows.observe(update_plot, names="value")
@@ -2652,19 +3103,19 @@ Instructions:
         padding="0px",
     )
     row_layout = Layout(
-        justify_content="flex-end",
+        justify_content="flex-start",
         align_items="center",
-        gap="0px",                     # small explicit gap
-        margin="0",
-        padding="0",
+        gap="0px",
+        margin="0px",
+        padding="0px",
         width="fit-content",
     )
     section_layout = Layout(
         border="1px solid gray",
         padding="0px 0px",
         margin="0",
-        width="285px",      # shrink section to children
-        align_items="flex-end",
+        width="fit-content",
+        align_items="flex-start",
     )
     scales_row_layout = Layout(
         justify_content="flex-start",
@@ -2680,36 +3131,37 @@ Instructions:
     # Controls layout
     controls = VBox([
         Label("DATA PRE-PROCESSING: Adaptive standardization with multiple scales and optional denoising", layout=Layout(padding="0px 0px 0px 5px")),
+        dataset_select if dataset_select is not None else Label("", layout=Layout(height="0px")),
         HBox([
             VBox([
                 HBox([use_small, std_type_small], layout=row_layout),
-                HBox([denoise_pre_small, sigma_pre_small], layout=row_layout),
+                HBox([pre_filter_small, make_parameter_switcher(pre_param_mode_small, {"sigma": sigma_pre_small, "lcut": bp_pre_low_cutoff_small, "hcut": bp_pre_high_cutoff_small, "order": (bp_pre_order_small, bp_pre_high_order_small)})], layout=row_layout),
                 HBox([w_small, c_small], layout=row_layout),
-                HBox([denoise_post_small, sigma_post_small], layout=row_layout),
+                HBox([post_filter_small, make_parameter_switcher(post_param_mode_small, {"sigma": sigma_post_small, "lcut": bp_post_low_cutoff_small, "hcut": bp_post_high_cutoff_small, "order": (bp_post_order_small, bp_post_high_order_small)})], layout=row_layout),
             ], layout=section_layout),
             VBox([
                 HBox([use_medium, std_type_medium], layout=row_layout),
-                HBox([denoise_pre_medium, sigma_pre_medium], layout=row_layout),
+                HBox([pre_filter_medium, make_parameter_switcher(pre_param_mode_medium, {"sigma": sigma_pre_medium, "lcut": bp_pre_low_cutoff_medium, "hcut": bp_pre_high_cutoff_medium, "order": (bp_pre_order_medium, bp_pre_high_order_medium)})], layout=row_layout),
                 HBox([w_med, c_med], layout=row_layout),
-                HBox([denoise_post_medium, sigma_post_medium], layout=row_layout),
+                HBox([post_filter_medium, make_parameter_switcher(post_param_mode_medium, {"sigma": sigma_post_medium, "lcut": bp_post_low_cutoff_medium, "hcut": bp_post_high_cutoff_medium, "order": (bp_post_order_medium, bp_post_high_order_medium)})], layout=row_layout),
             ], layout=section_layout),
             VBox([
                 HBox([use_large, std_type_large], layout=row_layout),
-                HBox([denoise_pre_large, sigma_pre_large], layout=row_layout),
+                HBox([pre_filter_large, make_parameter_switcher(pre_param_mode_large, {"sigma": sigma_pre_large, "lcut": bp_pre_low_cutoff_large, "hcut": bp_pre_high_cutoff_large, "order": (bp_pre_order_large, bp_pre_high_order_large)})], layout=row_layout),
                 HBox([w_large, c_large], layout=row_layout),
-                HBox([denoise_post_large, sigma_post_large], layout=row_layout),
+                HBox([post_filter_large, make_parameter_switcher(post_param_mode_large, {"sigma": sigma_post_large, "lcut": bp_post_low_cutoff_large, "hcut": bp_post_high_cutoff_large, "order": (bp_post_order_large, bp_post_high_order_large)})], layout=row_layout),
             ], layout=section_layout),
             VBox([
                 HBox([use_raw], layout=row_layout),
-                HBox([denoise_raw], layout=row_layout),
-                HBox([sigma_raw], layout=row_layout),  # spacer to align with window rows
+                HBox([raw_pre_filter]),
+                HBox([make_parameter_switcher(raw_pre_param_mode, {"sigma": raw_pre_sigma, "lcut": raw_pre_lcut, "hcut": raw_pre_hcut, "order": (raw_pre_low_order, raw_pre_high_order)})], layout=row_layout),
                 HBox([c_raw], layout=row_layout),
-            ], layout=Layout(border="1px solid gray",padding="0px 0px",margin="0",width="155px",align_items="flex-end",)),
+            ], layout=section_layout),
         ], layout=scales_row_layout),
 
         HBox([scea_label, growth_limit_w, detection_limit_w, local_box_size_w, max_pts_start_radius_w, run_btn], layout=parameters_layout),
         HBox([use_wind, wind_level, wind_scale_method, wind_scale_param], layout=parameters_layout),
-        HBox([overlay_option, vmax_q, show_clusters, cluster_select, overlay_wind_arrows], layout=Layout(padding="10px", display='flex', flex_flow='row wrap', align_items='center', justify_content='flex-start', gap='0px')),
+        HBox([overlay_option, vmin_q, vmax_q, show_clusters, cluster_select, overlay_wind_arrows], layout=Layout(padding="10px", display='flex', flex_flow='row wrap', align_items='center', justify_content='flex-start', gap='0px')),
     ], layout=controls_layout)
 
     # Display UI and initial plot
